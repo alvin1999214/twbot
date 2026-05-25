@@ -61,13 +61,23 @@ def remove_blocked_user(uid):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in USERBOT_LIST:
-        await update.message.reply_text("歡迎回來，Userbot 管理員。")
+        await update.message.reply_text(
+            "歡迎回來，Userbot 管理員。\n\n"
+            "可用指令：\n"
+            "/start - 啟動 Bot\n"
+            "/check - 檢查機器人狀態及正在監聽的群組"
+        )
         return
     if user_id not in normal_users:
         normal_users.add(user_id)
         save_normal_users(normal_users)
         logger.info(f"新普通用戶加入: {user_id}")
-    await update.message.reply_text("Bot 已啟動！當有新媒體消息時，您將會同步收到。")
+    await update.message.reply_text(
+        "Bot 已啟動！當有新媒體消息時，您將會同步收到。\n\n"
+        "可用指令：\n"
+        "/start - 啟動 Bot\n"
+        "/check - 檢查機器人狀態及正在監聽的群組"
+    )
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
