@@ -174,6 +174,10 @@ async def run_userbot(bot_app: Application):
         if not event.message.media:
             return
         
+        # 過濾貼圖 (Sticker)
+        if event.message.sticker:
+            return
+        
         media_group_id = event.message.grouped_id
         
         if media_group_id is None:
