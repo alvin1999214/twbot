@@ -30,6 +30,7 @@ logging.getLogger("telethon").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 LAST_FORWARD_TIME = "無記錄"
+LISTENING_GROUPS_INFO = {}  # 快取監聽群組資訊 {group_id: "群組名稱"}
 
 # ================= 資料持久化 =================
 def load_normal_users():
@@ -71,7 +72,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in USERBOT_LIST or user_id in normal_users:
-        await update.message.reply_text(f"🤖 Bot 狀態：運行中\n📅 上次轉發媒體時間：{LAST_FORWARD_TIME}")
+        status_msg = f"🤖 Bot 狀態：運行中\n📅 上次轉發媒體時間：{LAST_FORWARD_TIME}\n\n📡 正在監聽的群組：\n"
+        if LISTENING_GROUPS_INFO:
+            for gid, title in LISTENING_GROUPS_INFO.items():
+                status_msg += f"- {title} ({gid})\n"
+        else:
+            status_msg += "目前沒有監聽中的群組或正在初始化中。\n"
+        await update.message.reply_text(status_msg)
     else:
         await update.message.reply_text("請先輸入 /start 啟動 Bot。")
 
@@ -151,6 +158,16 @@ async def run_userbot(bot_app: Application):
         f.write(new_session_string)
         
     logger.info("Userbot 已成功啟動！正在監聽群組...")
+    
+    # 取得監聽群組資訊並儲存到 memory 中
+    global LISTENING_GROUPS_INFO
+    for group_id in LISTENING_GROUPS:
+        try:
+            entity = await client.get_entity(group_id)
+            LISTENING_GROUPS_INFO[group_id] = getattr(entity, 'title', str(group_id))
+        except Exception as e:
+            logger.error(f"獲取群組 {group_id} 資訊失敗: {e}")
+            LISTENING_GROUPS_INFO[group_id] = "未知群組"
     
     @client.on(events.NewMessage(chats=LISTENING_GROUPS))
     async def handler(event):
