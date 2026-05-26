@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.error import Forbidden
+from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -23,6 +23,9 @@ LISTENING_GROUPS = [int(x.strip()) for x in os.getenv("LISTENING_GROUPS", "").sp
 DATA_DIR = "/app/data"
 USERS_JSON_PATH = os.path.join(DATA_DIR, "users.json")
 SESSION_TXT_PATH = os.path.join(DATA_DIR, "userbot_session.txt")
+SEND_BATCH_SIZE = int(os.getenv("SEND_BATCH_SIZE", "20"))
+BATCH_PAUSE_SECONDS = float(os.getenv("BATCH_PAUSE_SECONDS", "0.4"))
+MAX_SEND_RETRIES = int(os.getenv("MAX_SEND_RETRIES", "3"))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -37,25 +40,108 @@ def load_normal_users():
     if os.path.exists(USERS_JSON_PATH):
         try:
             with open(USERS_JSON_PATH, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                raw = json.load(f)
+                if not isinstance(raw, list):
+                    logger.error("users.json 格式錯誤，預期為 list。")
+                    return set()
+                users = set()
+                for uid in raw:
+                    try:
+                        users.add(int(uid))
+                    except (TypeError, ValueError):
+                        logger.warning(f"跳過無效 user id: {uid}")
+                return users
         except Exception as e:
             logger.error(f"{e}")
     return set()
 
 def save_normal_users(users_set):
     try:
-        with open(USERS_JSON_PATH, "w", encoding="utf-8") as f:
-            json.dump(list(users_set), f, ensure_ascii=False, indent=4)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        tmp_path = f"{USERS_JSON_PATH}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(sorted(users_set), f, ensure_ascii=False, indent=4)
+        os.replace(tmp_path, USERS_JSON_PATH)
     except Exception as e:
         logger.error(f"{e}")
 
 normal_users = load_normal_users()
+users_lock = asyncio.Lock()
 
-def remove_blocked_user(uid):
-    if uid in normal_users:
-        normal_users.remove(uid)
-        save_normal_users(normal_users)
-        logger.info(f"用戶 {uid} 已封鎖 Bot，已從接收名單中移除。")
+async def get_latest_users_snapshot():
+    global normal_users
+    async with users_lock:
+        normal_users = load_normal_users()
+        return list(normal_users)
+
+async def add_normal_user(uid):
+    global normal_users
+    async with users_lock:
+        latest_users = load_normal_users()
+        if uid in latest_users:
+            normal_users = latest_users
+            return False
+        latest_users.add(uid)
+        save_normal_users(latest_users)
+        normal_users = latest_users
+        return True
+
+async def remove_blocked_user(uid):
+    global normal_users
+    async with users_lock:
+        latest_users = load_normal_users()
+        if uid in latest_users:
+            latest_users.remove(uid)
+            save_normal_users(latest_users)
+            normal_users = latest_users
+            logger.info(f"用戶 {uid} 已封鎖 Bot，已從接收名單中移除。")
+
+def iter_user_batches(users, batch_size):
+    size = max(1, batch_size)
+    for i in range(0, len(users), size):
+        yield users[i : i + size]
+
+async def copy_single_with_retry(msg, uid):
+    for attempt in range(1, MAX_SEND_RETRIES + 1):
+        try:
+            await msg.copy(chat_id=uid)
+            return
+        except Forbidden:
+            await remove_blocked_user(uid)
+            return
+        except RetryAfter as e:
+            wait_seconds = float(getattr(e, "retry_after", 1))
+            logger.warning(f"單圖發送給 {uid} 觸發限流，{wait_seconds}s 後重試。")
+            await asyncio.sleep(wait_seconds + 0.2)
+        except (TimedOut, NetworkError) as e:
+            if attempt >= MAX_SEND_RETRIES:
+                logger.error(f"單圖發送給 {uid} 失敗（網路/逾時）: {e}")
+                return
+            await asyncio.sleep(min(2 ** attempt, 5))
+        except Exception as e:
+            logger.error(f"單圖發送給 {uid} 失敗: {e}")
+            return
+
+async def copy_album_with_retry(bot, from_chat_id, msg_ids, uid):
+    for attempt in range(1, MAX_SEND_RETRIES + 1):
+        try:
+            await bot.copy_messages(chat_id=uid, from_chat_id=from_chat_id, message_ids=msg_ids)
+            return
+        except Forbidden:
+            await remove_blocked_user(uid)
+            return
+        except RetryAfter as e:
+            wait_seconds = float(getattr(e, "retry_after", 1))
+            logger.warning(f"相冊發送給 {uid} 觸發限流，{wait_seconds}s 後重試。")
+            await asyncio.sleep(wait_seconds + 0.2)
+        except (TimedOut, NetworkError) as e:
+            if attempt >= MAX_SEND_RETRIES:
+                logger.error(f"相冊發送給 {uid} 失敗（網路/逾時）: {e}")
+                return
+            await asyncio.sleep(min(2 ** attempt, 5))
+        except Exception as e:
+            logger.error(f"相冊發送給 {uid} 失敗: {e}")
+            return
 
 # ================= Bot 指令處理 =================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -68,9 +154,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/check - 檢查機器人狀態及正在監聽的群組"
         )
         return
-    if user_id not in normal_users:
-        normal_users.add(user_id)
-        save_normal_users(normal_users)
+    added = await add_normal_user(user_id)
+    if added:
         logger.info(f"新普通用戶加入: {user_id}")
     await update.message.reply_text(
         "Bot 已啟動！當有新媒體消息時，您將會同步收到。\n\n"
@@ -81,7 +166,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in USERBOT_LIST or user_id in normal_users:
+    users_snapshot = await get_latest_users_snapshot()
+    if user_id in USERBOT_LIST or user_id in users_snapshot:
         status_msg = f"🤖 Bot 狀態：運行中\n📅 上次轉發媒體時間：{LAST_FORWARD_TIME}\n\n📡 正在監聽的群組：\n"
         if LISTENING_GROUPS_INFO:
             for gid, title in LISTENING_GROUPS_INFO.items():
@@ -105,20 +191,17 @@ async def bot_inbox_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LAST_FORWARD_TIME
     LAST_FORWARD_TIME = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    current_users = list(normal_users)
+    current_users = await get_latest_users_snapshot()
     if not current_users:
         return
 
     gid = msg.media_group_id
     if not gid:
         # 單圖轉發
-        for uid in current_users:
-            try:
-                await msg.copy(chat_id=uid)
-            except Forbidden:
-                remove_blocked_user(uid)
-            except Exception as e:
-                logger.error(f"單一發送給 {uid} 失敗: {e}")
+        for user_batch in iter_user_batches(current_users, SEND_BATCH_SIZE):
+            for uid in user_batch:
+                await copy_single_with_retry(msg, uid)
+            await asyncio.sleep(BATCH_PAUSE_SECONDS)
     else:
         # 相冊收集並透過原生 copy_messages 完美群發
         async with ptb_cache_lock:
@@ -136,13 +219,11 @@ async def process_ptb_album(from_chat_id, gid, bot):
         return
     
     msg_ids.sort()
-    for uid in list(normal_users):
-        try:
-            await bot.copy_messages(chat_id=uid, from_chat_id=from_chat_id, message_ids=msg_ids)
-        except Forbidden:
-            remove_blocked_user(uid)
-        except Exception as e:
-            logger.error(f"相冊發送給 {uid} 失敗: {e}")
+    current_users = await get_latest_users_snapshot()
+    for user_batch in iter_user_batches(current_users, SEND_BATCH_SIZE):
+        for uid in user_batch:
+            await copy_album_with_retry(bot, from_chat_id, msg_ids, uid)
+        await asyncio.sleep(BATCH_PAUSE_SECONDS)
 
 # ================= Userbot 監聽邏輯 =================
 media_groups_cache = {}
