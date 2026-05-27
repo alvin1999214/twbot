@@ -158,25 +158,25 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if added:
         logger.info(f"新普通用戶加入: {user_id}")
     await update.message.reply_text(
-        "Bot 已啟動！當有新媒體消息時，您將會同步收到。\n\n"
+        "歡迎使用閃圖司機！當有新媒體消息時，您將會同步收到，自動跟車。\n\n"
         "可用指令：\n"
-        "/start - 啟動 Bot\n"
-        "/check - 檢查機器人狀態及正在監聽的群組"
+        "/start - 啟動機器人\n"
+        "/check - 檢查機器人狀態及正在跟車的群組"
     )
 
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     users_snapshot = await get_latest_users_snapshot()
     if user_id in USERBOT_LIST or user_id in users_snapshot:
-        status_msg = f"🤖 Bot 狀態：運行中\n📅 上次轉發媒體時間：{LAST_FORWARD_TIME}\n\n📡 正在監聽的群組：\n"
+        status_msg = f"🤖 Bot 狀態：運行中\n📅 上次轉發媒體時間：{LAST_FORWARD_TIME}\n\n📡 正在跟車的群組：\n"
         if LISTENING_GROUPS_INFO:
             for gid, title in LISTENING_GROUPS_INFO.items():
                 status_msg += f"- {title} ({gid})\n"
         else:
-            status_msg += "目前沒有監聽中的群組或正在初始化中。\n"
+            status_msg += "目前沒有跟車中的群組或正在初始化中。\n"
         await update.message.reply_text(status_msg)
     else:
-        await update.message.reply_text("請先輸入 /start 啟動 Bot。")
+        await update.message.reply_text("請先輸入 /start 啟動機器人。")
 
 # ================= Bot 廣播接收邏輯 =================
 ptb_media_cache = {}
