@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
@@ -189,7 +189,8 @@ async def bot_inbox_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     global LAST_FORWARD_TIME
-    LAST_FORWARD_TIME = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    hkt_tz = timezone(timedelta(hours=8))
+    LAST_FORWARD_TIME = datetime.now(hkt_tz).strftime("%Y-%m-%d %H:%M:%S")
 
     current_users = await get_latest_users_snapshot()
     if not current_users:
