@@ -366,10 +366,10 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = (
             f"🤖 Bot 狀態：運行中\n"
             f"📅 上次轉發媒體：{LAST_FORWARD_TIME}\n"
-            f"📦 待調度廣播任務數：{job_queue_size}\n"
-            f"📨 各用戶待發送總計：{send_queue_size}\n"
-            f"👥 已建立發送通道數：{len(user_send_queues)}\n"
-            f"⚡ 全局發送速率上限：{GLOBAL_RATE_LIMIT} 條/秒\n\n"
+            f"📦 待發送媒體數：{job_queue_size}\n"
+#            f"📨 各用戶待發送總計：{send_queue_size}\n"
+#            f"👥 已建立發送通道數：{len(user_send_queues)}\n"
+            f"⚡ TG車速速限：{GLOBAL_RATE_LIMIT} 條/秒\n\n"
             f"📡 正在跟車的群組：\n"
         )
         if LISTENING_GROUPS_INFO:
