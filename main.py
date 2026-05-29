@@ -140,6 +140,12 @@ async def add_normal_user(uid: int) -> bool:
         return True
 
 async def remove_blocked_user(uid: int):
+    """
+    Remove uid from the persistent user list.
+    Intentionally does NOT touch user_send_queues or user_sender_tasks:
+    the worker that called us IS the task — it cannot await itself.
+    Worker teardown is handled by _sender_worker after this returns.
+    """
     global normal_users
     async with users_lock:
         latest = load_normal_users()
@@ -167,10 +173,12 @@ async def _safe_send(coro_fn, uid: int):
         await rate_bucket.acquire()
         try:
             await coro_fn()
-            return  # success
+            return True   # success
         except Forbidden:
+            # Remove from DB — but do NOT touch tasks/queues here.
+            # The worker that called us will self-clean after we return False.
             await remove_blocked_user(uid)
-            return  # no point retrying
+            return False  # signal: user is gone, worker should exit
         except RetryAfter as e:
             wait_sec = float(getattr(e, "retry_after", 5)) + 1.0
             logger.warning(
@@ -186,91 +194,147 @@ async def _safe_send(coro_fn, uid: int):
         except (TimedOut, NetworkError) as e:
             if attempt >= MAX_SEND_RETRIES:
                 logger.error(f"發送給 {uid} 失敗（網路/逾時），已放棄: {e}")
-                return
+                return True
             await asyncio.sleep(min(2 ** attempt, 8))
         except Exception as e:
             logger.error(f"發送給 {uid} 未預期錯誤: {e}")
-            return
+            return True
 
-async def copy_single_with_retry(msg, uid: int):
-    await _safe_send(lambda: msg.copy(chat_id=uid), uid)
+async def copy_single_with_retry(msg, uid: int) -> bool:
+    return await _safe_send(lambda: msg.copy(chat_id=uid), uid)
 
-async def copy_album_with_retry(bot, from_chat_id: int, msg_ids: list, uid: int):
-    await _safe_send(
+async def copy_album_with_retry(bot, from_chat_id: int, msg_ids: list, uid: int) -> bool:
+    return await _safe_send(
         lambda: bot.copy_messages(
             chat_id=uid, from_chat_id=from_chat_id, message_ids=msg_ids
         ),
         uid,
     )
 
-# ================= Background broadcast worker (consumer) ====================
+# ================= Two-level broadcast pipeline ===============================
+#
+#  Level 1 – broadcast_queue  (job queue)
+#  ───────────────────────────────────────
+#  Each entry is a broadcast job: {type, users, msg | from_chat_id+msg_ids}.
+#  The dispatcher pulls jobs instantly and fans them out into per-user slots.
+#
+#  Level 2 – user_send_queues  (per-user FIFO, size-1 active + unbounded pending)
+#  ──────────────────────────────────────────────────────────────────────────────
+#  Every user uid owns one asyncio.Queue.  A fixed pool of SENDER_POOL_SIZE
+#  persistent coroutines ("sender workers") each own one uid and drain that
+#  queue forever.  Because each sender is independent, a FloodWait or slow
+#  send for uid-A never blocks uid-B.
+#
+#  The dispatcher never awaits individual sends — it just enqueues and moves on,
+#  so broadcast_queue.get() is always ready for the next job immediately.
+#
+#  Memory contract
+#  ───────────────
+#  At most  SENDER_POOL_SIZE × (pending jobs)  send-items live in memory at
+#  once.  With 1 000 users and 10 jobs queued that's 10 000 lightweight dicts —
+#  well within budget.  The token-bucket still caps total API throughput.
+
 broadcast_queue: asyncio.Queue | None = None
 
-# How many user-sends to run concurrently inside the worker.
-# The token bucket already limits the *rate*; this caps memory / task count.
-MAX_CONCURRENT_SENDS = int(os.getenv("MAX_CONCURRENT_SENDS", "50"))
+# One persistent coroutine per user.  Raising this above the user count wastes
+# nothing; lowering it means some users share a slot and can head-of-line block.
+# Default matches a typical deployment; override via env if user count grows.
+SENDER_POOL_SIZE = int(os.getenv("SENDER_POOL_SIZE", "1000"))
 
-async def broadcast_worker(bot):
+# Per-user send queues: uid -> asyncio.Queue of send-items
+# A send-item is a dict: {type, msg?} or {type, bot, from_chat_id, msg_ids}
+user_send_queues: dict[int, asyncio.Queue] = {}
+
+# Stores the Task object for each sender worker so it can be cancelled on cleanup.
+user_sender_tasks: dict[int, asyncio.Task] = {}
+
+
+async def _sender_worker(uid: int, bot):
     """
-    Single background task that drains broadcast_queue.
+    One persistent coroutine per user.  Drains that user's send queue.
 
-    Architecture
-    ────────────
-    Each job contains a full snapshot of the user list.  We fan-out to
-    MAX_CONCURRENT_SENDS parallel tasks, each of which goes through the
-    shared token bucket, so the aggregate send rate stays ≤ GLOBAL_RATE_LIMIT
-    regardless of how many jobs accumulate in the queue.
-
-    Throughput estimate (conservative):
-        25 sends/s × 30 s = 750 sends / broadcast window
-        With albums (1 API call per user), 1 000 users ≈ 40 s at 25 sends/s.
-        Tune GLOBAL_RATE_LIMIT up to 28–29 if you want tighter delivery.
+    Exit paths:
+      1. Forbidden  — _safe_send returns False; worker cleans up and returns.
+         This is the self-exit path.  We must NOT cancel/await ourselves here.
+      2. CancelledError — triggered externally (e.g. future admin command).
+         Drain the queue so task_done() counts stay balanced, then exit.
     """
-    logger.info("背景廣播工人已啟動！")
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_SENDS)
+    q = user_send_queues[uid]
+    try:
+        while True:
+            item = await q.get()   # CancelledError surfaces here when idle
+            try:
+                if item["type"] == "single":
+                    user_alive = await copy_single_with_retry(item["msg"], uid)
+                elif item["type"] == "album":
+                    user_alive = await copy_album_with_retry(
+                        bot, item["from_chat_id"], item["msg_ids"], uid
+                    )
+                else:
+                    user_alive = True
+            except asyncio.CancelledError:
+                raise   # finally: below calls q.task_done() exactly once
+            except Exception as e:
+                logger.error(f"sender_worker uid={uid} 未預期錯誤: {e}")
+                user_alive = True   # unknown error — keep the worker alive
+            finally:
+                q.task_done()
 
-    async def guarded(coro):
-        async with semaphore:
-            await coro
+            if not user_alive:
+                # User blocked the bot.  DB already cleaned by remove_blocked_user.
+                # Now clean up our own registry entries and exit — never await self.
+                user_sender_tasks.pop(uid, None)
+                user_send_queues.pop(uid, None)
+                logger.info(f"sender_worker uid={uid} 自我終止（用戶已封鎖 Bot）。")
+                return
+    except asyncio.CancelledError:
+        # External cancellation — drain pending items and exit cleanly.
+        while not q.empty():
+            try:
+                q.get_nowait()
+                q.task_done()
+            except asyncio.QueueEmpty:
+                break
+        user_sender_tasks.pop(uid, None)
+        user_send_queues.pop(uid, None)
+        logger.info(f"sender_worker uid={uid} 已停止（外部取消）。")
 
+
+async def broadcast_dispatcher(bot):
+    """
+    Level-1 consumer.  Pulls broadcast jobs and immediately distributes
+    send-items to every user's per-user queue.  Never awaits a send — returns
+    to queue.get() as fast as Python can iterate the user list.
+    """
+    logger.info("廣播調度器已啟動！")
     while True:
         try:
             job      = await broadcast_queue.get()
             job_type = job.get("type")
             users    = job.get("users", [])
 
-            if job_type == "single":
-                msg   = job["msg"]
-                tasks = [
-                    asyncio.create_task(
-                        guarded(copy_single_with_retry(msg, uid))
-                    )
-                    for uid in users
-                ]
+            for uid in users:
+                # Lazily create a queue + worker for first-seen users
+                if uid not in user_send_queues:
+                    user_send_queues[uid] = asyncio.Queue()
+                    user_sender_tasks[uid] = asyncio.create_task(_sender_worker(uid, bot))
 
-            elif job_type == "album":
-                from_chat_id = job["from_chat_id"]
-                msg_ids      = job["msg_ids"]
-                tasks = [
-                    asyncio.create_task(
-                        guarded(copy_album_with_retry(bot, from_chat_id, msg_ids, uid))
-                    )
-                    for uid in users
-                ]
+                if job_type == "single":
+                    await user_send_queues[uid].put({
+                        "type": "single",
+                        "msg":  job["msg"],
+                    })
+                elif job_type == "album":
+                    await user_send_queues[uid].put({
+                        "type":         "album",
+                        "from_chat_id": job["from_chat_id"],
+                        "msg_ids":      job["msg_ids"],
+                    })
 
-            else:
-                broadcast_queue.task_done()
-                continue
-
-            # Wait for the entire fan-out to complete before pulling the next
-            # job, so we never pile up unbounded tasks in memory.
-            # If you want pipeline parallelism (overlap jobs), replace with
-            # asyncio.gather(*tasks, return_exceptions=True) without await.
-            await asyncio.gather(*tasks, return_exceptions=True)
             broadcast_queue.task_done()
 
         except Exception as e:
-            logger.error(f"廣播隊列處理錯誤: {e}")
+            logger.error(f"廣播調度器錯誤: {e}")
 
 # ================= Bot command handlers ======================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -297,12 +361,15 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id       = update.effective_user.id
     users_snapshot = await get_latest_users_snapshot()
     if user_id in USERBOT_LIST or user_id in users_snapshot:
-        queue_size = broadcast_queue.qsize() if broadcast_queue else 0
+        job_queue_size  = broadcast_queue.qsize() if broadcast_queue else 0
+        send_queue_size = sum(q.qsize() for q in user_send_queues.values())
         status_msg = (
             f"🤖 Bot 狀態：運行中\n"
             f"📅 上次轉發媒體：{LAST_FORWARD_TIME}\n"
-            f"📦 等待發送的排隊任務數：{queue_size}\n"
-            f"⚡ TG車速速限：{GLOBAL_RATE_LIMIT} 條/秒\n\n"
+            f"📦 待調度廣播任務數：{job_queue_size}\n"
+            f"📨 各用戶待發送總計：{send_queue_size}\n"
+            f"👥 已建立發送通道數：{len(user_send_queues)}\n"
+            f"⚡ 全局發送速率上限：{GLOBAL_RATE_LIMIT} 條/秒\n\n"
             f"📡 正在跟車的群組：\n"
         )
         if LISTENING_GROUPS_INFO:
@@ -439,8 +506,8 @@ async def post_init(application: Application):
     rate_bucket     = TokenBucket(GLOBAL_RATE_LIMIT)
     broadcast_queue = asyncio.Queue()
 
-    # Single long-running broadcast consumer
-    application.create_task(broadcast_worker(application.bot))
+    # Level-1 dispatcher (non-blocking fan-out to per-user queues)
+    application.create_task(broadcast_dispatcher(application.bot))
     # Userbot listener
     application.create_task(run_userbot(application))
 
