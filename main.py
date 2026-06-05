@@ -615,14 +615,15 @@ async def run_userbot(bot_app: Application):
         await client.connect()
 
         if not await client.is_user_authorized():
+            # post_init 已完成認證，到這裡仍未授權代表 session 異常
             logger.error(
-                "Userbot 尚未授權或授權已失效！\n"
-                "請以互動模式重新登入：docker compose run -it --rm tg_bot"
+                "Userbot 連線後仍未授權，請重新以互動模式登入：\n"
+                "  docker compose run -it --rm tg_bot"
             )
             await client.disconnect()
             return
 
-        # Persist refreshed session string after successful connect
+        # 刷新並持久化 session（防止 session 過期）
         new_session = client.session.save()
         if new_session:
             os.makedirs(DATA_DIR, exist_ok=True)
@@ -649,8 +650,7 @@ async def run_userbot(bot_app: Application):
             if media_group_id is None:
                 try:
                     custom_caption = await get_custom_caption(event.message, is_edited)
-                    # Always download locally then upload — works for both
-                    # restricted (noforwards) and unrestricted chats.
+                    # 統一走下載→上傳→刪除，不使用 native forward
                     await process_restricted_message(client, event.message, custom_caption)
                 except Exception as e:
                     logger.error(f"Userbot 單一媒體轉發至 Bot 失敗: {e}")
@@ -680,7 +680,7 @@ async def run_userbot(bot_app: Application):
                 messages.sort(key=lambda x: x.id)
                 try:
                     custom_caption = await get_custom_caption(messages[0], is_edited)
-                    # Always download locally then upload — unified path.
+                    # 統一走下載→上傳→刪除，不使用 native forward
                     await process_restricted_album(client, messages, custom_caption)
                 except Exception as e:
                     logger.error(f"Userbot 相冊轉發至 Bot 失敗: {e}")
@@ -696,22 +696,13 @@ async def run_userbot(bot_app: Application):
         logger.info("Userbot 已斷線。")
 
 # ================= Application bootstrap =====================================
-async def post_init(application: Application):
-    global rate_bucket, broadcast_queue
-    rate_bucket     = TokenBucket(GLOBAL_RATE_LIMIT)
-    broadcast_queue = asyncio.Queue()
 
-    # Level-1 dispatcher (non-blocking fan-out to per-user queues)
-    application.create_task(broadcast_dispatcher(application.bot))
-    # Userbot listener
-    application.create_task(run_userbot(application))
-
-def authenticate_userbot():
+async def _do_userbot_auth() -> bool:
     """
-    互動式首次登入。
-    - 有 session 且有效 → 直接返回（免登入）
-    - 無 session 或失效 → 要求互動輸入，成功後寫入 SESSION_TXT_PATH
-    - 非 TTY 環境（docker compose up -d）→ 記錄錯誤並 raise，讓 main() 中止
+    在當前 event loop 內執行 userbot 認證。
+    - Session 有效 → 直接返回 True
+    - Session 無效且是 TTY → 互動登入，寫入 session，返回 True
+    - Session 無效且非 TTY → 記錄錯誤，返回 False
     """
     import sys
 
@@ -721,54 +712,71 @@ def authenticate_userbot():
             session_string = f.read().strip()
 
     client = TelegramClient(StringSession(session_string), USERBOT_KEY, USERBOT_HASH)
-
-    async def do_auth():
+    try:
         await client.connect()
+
         if await client.is_user_authorized():
             logger.info("Userbot session 有效，跳過登入流程。")
-            await client.disconnect()
-            return
+            return True
 
+        # ── 需要互動登入 ──────────────────────────────────────────────────────
         if not sys.stdin.isatty():
-            raise EOFError(
-                "終端機無互動模式！首次登入請務必使用指令：\n"
+            logger.error(
+                "Userbot session 無效且終端機無互動模式！\n"
+                "請先以互動模式登入：\n"
                 "  docker compose run -it --rm tg_bot"
             )
+            return False
 
         logger.info("Userbot 未授權，進入互動式登入流程…")
-        try:
-            await client.start(
-                phone=lambda: input("📱 請輸入手機號碼 (包含國碼，如 +852 / +886): "),
-                password=lambda: input("🔑 兩步驗證密碼 (若無請直接按 Enter): ") or None,
-                code_callback=lambda: input("💬 請輸入 Telegram 收到的驗證碼: ")
-            )
-            os.makedirs(DATA_DIR, exist_ok=True)
-            session_str = client.session.save()
-            with open(SESSION_TXT_PATH, "w") as f:
-                f.write(session_str)
-            logger.info(f"✅ Userbot 登入成功！Session 已儲存至 {SESSION_TXT_PATH}")
-        except EOFError:
-            raise
-        finally:
+        await client.start(
+            phone=lambda: input("📱 請輸入手機號碼 (包含國碼，如 +852 / +886): "),
+            password=lambda: input("🔑 兩步驗證密碼 (若無請直接按 Enter): ") or None,
+            code_callback=lambda: input("💬 請輸入 Telegram 收到的驗證碼: "),
+        )
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(SESSION_TXT_PATH, "w") as f:
+            f.write(client.session.save())
+        logger.info(f"✅ 登入成功！Session 已儲存至 {SESSION_TXT_PATH}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Userbot 認證失敗: {e}")
+        return False
+    finally:
+        if client.is_connected():
             await client.disconnect()
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(do_auth())
-    finally:
-        loop.close()
+
+async def post_init(application: Application):
+    """
+    在 PTB 的 event loop 內執行：
+    1. 先完成 userbot 認證（同一 loop，無跨 loop 問題）
+    2. 初始化 rate_bucket / broadcast_queue
+    3. 啟動 dispatcher 和 userbot 監聽任務
+    """
+    global rate_bucket, broadcast_queue
+
+    # ── Step 1: 認證（在 PTB loop 內，不另起 loop）──────────────────────────
+    auth_ok = await _do_userbot_auth()
+    if not auth_ok:
+        logger.error("Userbot 認證未通過，Bot 將停止。")
+        await application.stop()
+        return
+
+    # ── Step 2: 初始化共享狀態（在同一 loop，不存在綁定問題）───────────────
+    rate_bucket     = TokenBucket(GLOBAL_RATE_LIMIT)
+    broadcast_queue = asyncio.Queue()
+
+    # ── Step 3: 啟動後台任務（application 此時已在運行中）───────────────────
+    application.create_task(broadcast_dispatcher(application.bot))
+    application.create_task(run_userbot(application))
+
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.chdir(DATA_DIR)
-    
-    try:
-        authenticate_userbot()
-    except Exception as e:
-        logger.error(f"Userbot 登入過程發生錯誤: {e}")
-        return
-        
+
     bot_app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -782,6 +790,7 @@ def main():
     )
     logger.info("Telegram Bot 正在啟動…")
     bot_app.run_polling()
+
 
 if __name__ == "__main__":
     main()

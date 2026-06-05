@@ -23,7 +23,7 @@ COPY main.py .
 
 # 這是解決 Oracle 主機權限的核心：
 # 在容器內創建一個 UID 1000 的 appuser，與主機的 opc/ubuntu 用戶對齊
-RUN useradd -u 1001 -m appuser && chown -R appuser:appuser /app
+RUN useradd -u 1000 -m appuser && chown -R appuser:appuser /app
 USER appuser
 
 CMD ["python", "main.py"]
