@@ -560,7 +560,7 @@ def setup_userbot():
     os.makedirs(DATA_DIR, exist_ok=True)
     session_str = ""
     if os.path.exists(SESSION_TXT_PATH):
-        with open(SESSION_TXT_PATH, "r") as f: session_string = f.read().strip()
+        with open(SESSION_TXT_PATH, "r") as f: session_str = f.read().strip()
 
     async def _do_auth():
         client = TelegramClient(StringSession(session_str), USERBOT_KEY, USERBOT_HASH)
