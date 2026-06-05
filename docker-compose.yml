@@ -6,7 +6,7 @@ services:
     container_name: tg_forward_bot
     restart: always
     # 強制使用 UID 1000 運行，確保掛載到主機的 data 權限與 opc/ubuntu 一致
-    user: "1000:1000"
+    user: "1001:1001"
     volumes:
       - ./data:/app/data
     env_file:
