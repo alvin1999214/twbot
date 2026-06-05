@@ -277,7 +277,7 @@ async def broadcast_dispatcher(bot):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in WHITELIST_USERS:
-        await update.message.reply_text("⛔ 您不在授權的白名單內，無法使用此機器人。")
+        await update.message.reply_text("🌟")
         return
 
     if user_id in USERBOT_LIST:
