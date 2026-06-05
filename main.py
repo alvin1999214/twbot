@@ -615,12 +615,19 @@ async def run_userbot(bot_app: Application):
         await client.connect()
 
         if not await client.is_user_authorized():
-            logger.error("Userbot 尚未授權或授權已失效！請重新啟動程式進行認證。")
+            logger.error(
+                "Userbot 尚未授權或授權已失效！\n"
+                "請以互動模式重新登入：docker compose run -it --rm tg_bot"
+            )
+            await client.disconnect()
             return
 
-        # Persist refreshed session
-        with open(SESSION_TXT_PATH, "w") as f:
-            f.write(client.session.save())
+        # Persist refreshed session string after successful connect
+        new_session = client.session.save()
+        if new_session:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(SESSION_TXT_PATH, "w") as f:
+                f.write(new_session)
 
         logger.info("Userbot 已成功啟動，正在監聽群組…")
 
@@ -641,12 +648,10 @@ async def run_userbot(bot_app: Application):
 
             if media_group_id is None:
                 try:
-                    chat = await event.get_chat()
                     custom_caption = await get_custom_caption(event.message, is_edited)
-                    if getattr(chat, 'noforwards', False):
-                        await process_restricted_message(client, event.message, custom_caption)
-                    else:
-                        await client.send_file(BOT_USERNAME, event.message.media, caption=custom_caption)
+                    # Always download locally then upload — works for both
+                    # restricted (noforwards) and unrestricted chats.
+                    await process_restricted_message(client, event.message, custom_caption)
                 except Exception as e:
                     logger.error(f"Userbot 單一媒體轉發至 Bot 失敗: {e}")
             else:
@@ -674,13 +679,9 @@ async def run_userbot(bot_app: Application):
             if messages:
                 messages.sort(key=lambda x: x.id)
                 try:
-                    chat = await messages[0].get_chat()
                     custom_caption = await get_custom_caption(messages[0], is_edited)
-                    if getattr(chat, 'noforwards', False):
-                        await process_restricted_album(client, messages, custom_caption)
-                    else:
-                        media_list = [m.media for m in messages]
-                        await client.send_file(BOT_USERNAME, media_list, caption=custom_caption)
+                    # Always download locally then upload — unified path.
+                    await process_restricted_album(client, messages, custom_caption)
                 except Exception as e:
                     logger.error(f"Userbot 相冊轉發至 Bot 失敗: {e}")
 
@@ -706,6 +707,14 @@ async def post_init(application: Application):
     application.create_task(run_userbot(application))
 
 def authenticate_userbot():
+    """
+    互動式首次登入。
+    - 有 session 且有效 → 直接返回（免登入）
+    - 無 session 或失效 → 要求互動輸入，成功後寫入 SESSION_TXT_PATH
+    - 非 TTY 環境（docker compose up -d）→ 記錄錯誤並 raise，讓 main() 中止
+    """
+    import sys
+
     session_string = ""
     if os.path.exists(SESSION_TXT_PATH):
         with open(SESSION_TXT_PATH, "r") as f:
@@ -715,21 +724,33 @@ def authenticate_userbot():
 
     async def do_auth():
         await client.connect()
-        if not await client.is_user_authorized():
-            logger.info("Userbot 未授權！即將進入互動式登入流程...")
-            try:
-                await client.start(
-                    phone=lambda: input("📱 請輸入手機號碼 (包含國碼，如 +886...): "),
-                    password=lambda: input("🔑 請輸入兩步驗證密碼 (若無請直接 Enter): "),
-                    code_callback=lambda: input("💬 請輸入 Telegram 收到的驗證碼: ")
-                )
-                with open(SESSION_TXT_PATH, "w") as f:
-                    f.write(client.session.save())
-                logger.info("Userbot 登入成功！")
-            except EOFError:
-                logger.error("終端機無互動模式！首次登入請務必使用指令: docker compose run -it --rm tg_bot")
-                raise
-        await client.disconnect()
+        if await client.is_user_authorized():
+            logger.info("Userbot session 有效，跳過登入流程。")
+            await client.disconnect()
+            return
+
+        if not sys.stdin.isatty():
+            raise EOFError(
+                "終端機無互動模式！首次登入請務必使用指令：\n"
+                "  docker compose run -it --rm tg_bot"
+            )
+
+        logger.info("Userbot 未授權，進入互動式登入流程…")
+        try:
+            await client.start(
+                phone=lambda: input("📱 請輸入手機號碼 (包含國碼，如 +852 / +886): "),
+                password=lambda: input("🔑 兩步驗證密碼 (若無請直接按 Enter): ") or None,
+                code_callback=lambda: input("💬 請輸入 Telegram 收到的驗證碼: ")
+            )
+            os.makedirs(DATA_DIR, exist_ok=True)
+            session_str = client.session.save()
+            with open(SESSION_TXT_PATH, "w") as f:
+                f.write(session_str)
+            logger.info(f"✅ Userbot 登入成功！Session 已儲存至 {SESSION_TXT_PATH}")
+        except EOFError:
+            raise
+        finally:
+            await client.disconnect()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
