@@ -603,7 +603,6 @@ media_groups_cache: dict = {}
 cache_lock = asyncio.Lock()
 
 async def run_userbot(bot_app: Application):
-    os.chdir(DATA_DIR)
     session_string = ""
     if os.path.exists(SESSION_TXT_PATH):
         with open(SESSION_TXT_PATH, "r") as f:
@@ -612,79 +611,88 @@ async def run_userbot(bot_app: Application):
     client = TelegramClient(
         StringSession(session_string), USERBOT_KEY, USERBOT_HASH
     )
-    await client.connect()
+    try:
+        await client.connect()
 
-    if not await client.is_user_authorized():
-        logger.error("Userbot 尚未授權或授權已失效！請重新啟動程式進行認證。")
-        return
-
-    # Persist refreshed session
-    with open(SESSION_TXT_PATH, "w") as f:
-        f.write(client.session.save())
-
-    logger.info("Userbot 已成功啟動，正在監聽群組…")
-
-    global LISTENING_GROUPS_INFO
-    for group_id in LISTENING_GROUPS:
-        try:
-            entity = await client.get_entity(group_id)
-            LISTENING_GROUPS_INFO[group_id] = getattr(entity, "title", str(group_id))
-        except Exception as e:
-            logger.error(f"獲取群組 {group_id} 資訊失敗: {e}")
-            LISTENING_GROUPS_INFO[group_id] = "未知群組"
-
-    async def handle_media_event(client, event, is_edited: bool):
-        if not event.message.media or event.message.sticker:
+        if not await client.is_user_authorized():
+            logger.error("Userbot 尚未授權或授權已失效！請重新啟動程式進行認證。")
             return
 
-        media_group_id = event.message.grouped_id
+        # Persist refreshed session
+        with open(SESSION_TXT_PATH, "w") as f:
+            f.write(client.session.save())
 
-        if media_group_id is None:
+        logger.info("Userbot 已成功啟動，正在監聽群組…")
+
+        global LISTENING_GROUPS_INFO
+        for group_id in LISTENING_GROUPS:
             try:
-                chat = await event.get_chat()
-                custom_caption = await get_custom_caption(event.message, is_edited)
-                if getattr(chat, 'noforwards', False):
-                    await process_restricted_message(client, event.message, custom_caption)
-                else:
-                    await client.send_file(BOT_USERNAME, event.message.media, caption=custom_caption)
+                entity = await client.get_entity(group_id)
+                LISTENING_GROUPS_INFO[group_id] = getattr(entity, "title", str(group_id))
             except Exception as e:
-                logger.error(f"Userbot 單一媒體轉發至 Bot 失敗: {e}")
-        else:
-            cache_key = f"{media_group_id}_{'edit' if is_edited else 'new'}"
+                logger.error(f"獲取群組 {group_id} 資訊失敗: {e}")
+                LISTENING_GROUPS_INFO[group_id] = "未知群組"
+
+        async def handle_media_event(client, event, is_edited: bool):
+            if not event.message.media or event.message.sticker:
+                return
+
+            media_group_id = event.message.grouped_id
+
+            if media_group_id is None:
+                try:
+                    chat = await event.get_chat()
+                    custom_caption = await get_custom_caption(event.message, is_edited)
+                    if getattr(chat, 'noforwards', False):
+                        await process_restricted_message(client, event.message, custom_caption)
+                    else:
+                        await client.send_file(BOT_USERNAME, event.message.media, caption=custom_caption)
+                except Exception as e:
+                    logger.error(f"Userbot 單一媒體轉發至 Bot 失敗: {e}")
+            else:
+                cache_key = f"{media_group_id}_{'edit' if is_edited else 'new'}"
+                async with cache_lock:
+                    if cache_key not in media_groups_cache:
+                        media_groups_cache[cache_key] = []
+                        asyncio.create_task(
+                            process_media_group(client, cache_key, is_edited)
+                        )
+                    media_groups_cache[cache_key].append(event.message)
+
+        @client.on(events.NewMessage(chats=LISTENING_GROUPS))
+        async def new_message_handler(event):
+            await handle_media_event(client, event, is_edited=False)
+
+        @client.on(events.MessageEdited(chats=LISTENING_GROUPS))
+        async def edited_message_handler(event):
+            await handle_media_event(client, event, is_edited=True)
+
+        async def process_media_group(client, cache_key, is_edited):
+            await asyncio.sleep(0.8)
             async with cache_lock:
-                if cache_key not in media_groups_cache:
-                    media_groups_cache[cache_key] = []
-                    asyncio.create_task(
-                        process_media_group(client, cache_key, is_edited)
-                    )
-                media_groups_cache[cache_key].append(event.message)
+                messages = media_groups_cache.pop(cache_key, [])
+            if messages:
+                messages.sort(key=lambda x: x.id)
+                try:
+                    chat = await messages[0].get_chat()
+                    custom_caption = await get_custom_caption(messages[0], is_edited)
+                    if getattr(chat, 'noforwards', False):
+                        await process_restricted_album(client, messages, custom_caption)
+                    else:
+                        media_list = [m.media for m in messages]
+                        await client.send_file(BOT_USERNAME, media_list, caption=custom_caption)
+                except Exception as e:
+                    logger.error(f"Userbot 相冊轉發至 Bot 失敗: {e}")
 
-    @client.on(events.NewMessage(chats=LISTENING_GROUPS))
-    async def new_message_handler(event):
-        await handle_media_event(client, event, is_edited=False)
-
-    @client.on(events.MessageEdited(chats=LISTENING_GROUPS))
-    async def edited_message_handler(event):
-        await handle_media_event(client, event, is_edited=True)
-
-    async def process_media_group(client, cache_key, is_edited):
-        await asyncio.sleep(0.8)
-        async with cache_lock:
-            messages = media_groups_cache.pop(cache_key, [])
-        if messages:
-            messages.sort(key=lambda x: x.id)
-            try:
-                chat = await messages[0].get_chat()
-                custom_caption = await get_custom_caption(messages[0], is_edited)
-                if getattr(chat, 'noforwards', False):
-                    await process_restricted_album(client, messages, custom_caption)
-                else:
-                    media_list = [m.media for m in messages]
-                    await client.send_file(BOT_USERNAME, media_list, caption=custom_caption)
-            except Exception as e:
-                logger.error(f"Userbot 相冊轉發至 Bot 失敗: {e}")
-
-    await client.run_until_disconnected()
+        await client.run_until_disconnected()
+    except asyncio.CancelledError:
+        logger.info("Userbot 監聽任務被取消。")
+    except Exception as e:
+        logger.error(f"Userbot 監聽任務發生未預期錯誤: {e}")
+    finally:
+        if client.is_connected():
+            await client.disconnect()
+        logger.info("Userbot 已斷線。")
 
 # ================= Application bootstrap =====================================
 async def post_init(application: Application):
@@ -732,6 +740,7 @@ def authenticate_userbot():
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
+    os.chdir(DATA_DIR)
     
     try:
         authenticate_userbot()
