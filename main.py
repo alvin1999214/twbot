@@ -437,18 +437,28 @@ def setup_userbot():
         print(f"\n❌ Userbot 登入發生未預期錯誤: {e}")
         sys.exit(1)
 
+bg_tasks = set()
+
 async def post_init(application: Application):
-    global rate_bucket, broadcast_queue, users_lock, ptb_cache_lock, cache_lock
+    global rate_bucket, broadcast_queue, users_lock, ptb_cache_lock, cache_lock, bg_tasks
     rate_bucket     = TokenBucket(GLOBAL_RATE_LIMIT)
     broadcast_queue = asyncio.Queue()
     
-    # 延遲到 Event Loop 確立後才初始化 Locks，避免 bound to different event loop 錯誤
+    # 延遲到 Event Loop 確立後才初始化 Locks
     users_lock      = asyncio.Lock()
     ptb_cache_lock  = asyncio.Lock()
     cache_lock      = asyncio.Lock()
 
-    application.create_task(broadcast_dispatcher(application.bot))
-    application.create_task(run_userbot(application))
+    # 使用 asyncio.create_task 建立任務，並保存到 bg_tasks 中
+    dispatcher_task = asyncio.create_task(broadcast_dispatcher(application.bot))
+    userbot_task = asyncio.create_task(run_userbot(application))
+
+    bg_tasks.add(dispatcher_task)
+    bg_tasks.add(userbot_task)
+
+    # 當任務意外結束時，自動將它從集合中移除
+    dispatcher_task.add_done_callback(bg_tasks.discard)
+    userbot_task.add_done_callback(bg_tasks.discard)
 
 def main():
     # 啟動前強制檢查並處理 Userbot 授權
