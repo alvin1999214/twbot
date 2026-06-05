@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from telegram import Update
 from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telethon import TelegramClient, events
@@ -154,17 +154,17 @@ async def _safe_send(coro_fn, uid: int):
             wait_sec = float(getattr(e, "retry_after", 5)) + 1.0
             floodwait_until = max(floodwait_until, asyncio.get_event_loop().time() + wait_sec)
             await asyncio.sleep(wait_sec)
-        except (TimedOut, NetworkError) as e:
-            if attempt >= MAX_SEND_RETRIES:
-                return True, None
+        except (TimedOut, NetworkError):
+            if attempt >= MAX_SEND_RETRIES: return True, None
             await asyncio.sleep(min(2 ** attempt, 8))
         except Exception as e:
             logger.error(f"發送給 {uid} 未預期錯誤: {e}")
             return True, None
     return True, None
 
-async def copy_single_with_retry(msg, uid: int):
-    return await _safe_send(lambda: msg.copy(chat_id=uid), uid)
+async def copy_single_with_retry(msg, uid: int, reply_to_msg_id: int = None):
+    # 若有指定 reply_to_msg_id，就會以回覆的形式發送給用戶
+    return await _safe_send(lambda: msg.copy(chat_id=uid, reply_to_message_id=reply_to_msg_id), uid)
 
 async def copy_album_with_retry(bot, from_chat_id: int, msg_ids: list, uid: int):
     return await _safe_send(
@@ -174,7 +174,6 @@ async def copy_album_with_retry(bot, from_chat_id: int, msg_ids: list, uid: int)
 
 # ================= Two-level broadcast pipeline ===============================
 broadcast_queue: asyncio.Queue | None = None
-SENDER_POOL_SIZE = int(os.getenv("SENDER_POOL_SIZE", "1000"))
 user_send_queues: dict[int, asyncio.Queue] = {}
 user_sender_tasks: dict[int, asyncio.Task] = {}
 
@@ -194,6 +193,17 @@ async def _sender_worker(uid: int, bot):
             try:
                 if item["type"] == "single":
                     user_alive, res = await copy_single_with_retry(item["msg"], uid)
+                    if res:
+                        curr = ptb_broadcast_map.get(item["bot_msg_id"], [])
+                        curr.append((uid, res.message_id))
+                        ptb_broadcast_map[item["bot_msg_id"]] = curr
+
+                elif item["type"] == "reply":
+                    # 尋找該用戶對應的原始訊息 ID，好讓新媒體能精準回覆
+                    reply_targets = ptb_broadcast_map.get(item["reply_to_bot_msg_id"], [])
+                    target_sent_msg_id = next((m_id for u, m_id in reply_targets if u == uid), None)
+                    
+                    user_alive, res = await copy_single_with_retry(item["msg"], uid, reply_to_msg_id=target_sent_msg_id)
                     if res:
                         curr = ptb_broadcast_map.get(item["bot_msg_id"], [])
                         curr.append((uid, res.message_id))
@@ -247,6 +257,13 @@ async def broadcast_dispatcher(bot):
 
                 if job_type == "single":
                     await user_send_queues[uid].put({"type": "single", "msg": job["msg"], "bot_msg_id": job["msg"].message_id})
+                elif job_type == "reply":
+                    await user_send_queues[uid].put({
+                        "type": "reply", 
+                        "msg": job["msg"], 
+                        "bot_msg_id": job["msg"].message_id, 
+                        "reply_to_bot_msg_id": job["reply_to_bot_msg_id"]
+                    })
                 elif job_type == "album":
                     await user_send_queues[uid].put({"type": "album", "from_chat_id": job["from_chat_id"], "msg_ids": job["msg_ids"]})
 
@@ -299,6 +316,19 @@ async def bot_inbox_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_users = await get_latest_users_snapshot()
     if not current_users: return
 
+    # 判斷是否為 Userbot 針對「編輯」傳來的回覆訊息
+    if msg.reply_to_message:
+        reply_to_bot_msg_id = msg.reply_to_message.message_id
+        if reply_to_bot_msg_id in ptb_broadcast_map:
+            await broadcast_queue.put({
+                "type": "reply",
+                "msg": msg,
+                "reply_to_bot_msg_id": reply_to_bot_msg_id,
+                "users": current_users
+            })
+            return
+
+    # 一般單圖或相冊處理邏輯
     gid = msg.media_group_id
     if not gid:
         await broadcast_queue.put({"type": "single", "msg": msg, "users": current_users})
@@ -318,34 +348,6 @@ async def process_ptb_album(from_chat_id: int, gid: str, bot):
     
     current_users = await get_latest_users_snapshot()
     await broadcast_queue.put({"type": "album", "from_chat_id": from_chat_id, "msg_ids": msg_ids, "users": current_users})
-
-# 攔截包含替換檔案的編輯事件並廣播
-async def bot_edited_inbox_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.edited_message
-    if not msg: return
-    bot_msg_id = msg.message_id
-    new_caption = msg.caption or msg.text or ""
-
-    if bot_msg_id in ptb_broadcast_map:
-        # 建立新的媒體物件 (利用 Telegram 伺服器上已有的 file_id，免除重新上傳)
-        media = None
-        if msg.photo:
-            media = InputMediaPhoto(media=msg.photo[-1].file_id, caption=new_caption)
-        elif msg.video:
-            media = InputMediaVideo(media=msg.video.file_id, caption=new_caption)
-        elif msg.document:
-            media = InputMediaDocument(media=msg.document.file_id, caption=new_caption)
-
-        for uid, sent_msg_id in ptb_broadcast_map[bot_msg_id]:
-            try:
-                if media:
-                    # 抽換媒體與文字
-                    await context.bot.edit_message_media(chat_id=uid, message_id=sent_msg_id, media=media)
-                else:
-                    # 僅修改文字
-                    await context.bot.edit_message_caption(chat_id=uid, message_id=sent_msg_id, caption=new_caption)
-            except Exception:
-                pass 
 
 # ================= Media Processing Helpers (ffmpeg) =========================
 async def get_video_metadata(file_path: str):
@@ -374,11 +376,13 @@ async def build_caption(msg, is_edit=False):
     sender = await msg.get_sender()
     sender_id = sender.id if sender else "未知"
     username = f"@{sender.username}" if sender and getattr(sender, 'username', None) else "無"
-    status = "#已編輯" if is_edit else "#原始媒體"
+    status = "#修訂版" if is_edit else "#原始媒體"
     
     text = msg.text or ""
+    # 如果是修訂版，在最上方加上顯眼的提示
+    prefix = "⚠️ [此為發送者修改後的新版本]\n\n" if is_edit else ""
     info = f"\n\n👤 發送者 ID: {sender_id}\n🔗 發送者: {username}\n📌 狀態: {status}"
-    return text + info
+    return prefix + text + info
 
 # ================= Userbot listener ==========================================
 media_groups_cache: dict = {}
@@ -422,47 +426,47 @@ async def run_userbot(bot_app: Application):
                     asyncio.create_task(process_media_group(client, media_group_id))
                 media_groups_cache[media_group_id].append(event.message)
 
-    # Userbot 編輯監聽器：判斷是否有新媒體，重新下載後再進行覆蓋
+    # Userbot 編輯監聽器：下載新媒體，以「回覆舊訊息」的方式重新發送給 Bot
     @client.on(events.MessageEdited(chats=LISTENING_GROUPS))
     async def userbot_edit_handler(event):
         source_id = event.id
         if source_id in userbot_msg_map:
             sent_ids = userbot_msg_map[source_id]
-            for s_id in sent_ids:
-                new_caption = await build_caption(event.message, is_edit=True)
-                
-                # 若編輯後包含新的媒體內容，則重新下載
-                if event.message.media and not event.message.sticker:
-                    is_video = bool(event.message.video)
-                    tmp_id = uuid.uuid4().hex
-                    ext = ".mp4" if is_video else ".jpg"
-                    file_path = f"/tmp/dl_edit_{tmp_id}{ext}"
-                    thumb_path = f"/tmp/thumb_edit_{tmp_id}.jpg"
-                    
-                    try:
-                        await client.download_media(event.message, file=file_path)
-                        if is_video:
-                            w, h, d = await get_video_metadata(file_path)
-                            has_thumb = await generate_thumbnail(file_path, thumb_path)
-                            await client.edit_message(
-                                BOT_USERNAME, s_id, text=new_caption, file=file_path,
-                                thumb=thumb_path if has_thumb else None,
-                                attributes=[DocumentAttributeVideo(duration=d, w=w, h=h)]
-                            )
-                        else:
-                            await client.edit_message(BOT_USERNAME, s_id, text=new_caption, file=file_path)
-                    except Exception as e:
-                        logger.error(f"Userbot 替換媒體失敗: {e}")
-                    finally:
-                        # 嚴格保證本地檔案刪除
-                        if os.path.exists(file_path): os.remove(file_path)
-                        if os.path.exists(thumb_path): os.remove(thumb_path)
+            s_id = sent_ids[0] # 對應在 Bot 收件匣裡的原始訊息 ID
+            
+            is_video, is_photo = bool(event.message.video), bool(event.message.photo)
+            if not (is_video or is_photo): return # 沒有媒體則略過
+
+            new_caption = await build_caption(event.message, is_edit=True)
+            tmp_id = uuid.uuid4().hex
+            ext = ".mp4" if is_video else ".jpg"
+            file_path = f"/tmp/dl_edit_{tmp_id}{ext}"
+            thumb_path = f"/tmp/thumb_edit_{tmp_id}.jpg"
+            
+            try:
+                await client.download_media(event.message, file=file_path)
+                if is_video:
+                    w, h, d = await get_video_metadata(file_path)
+                    has_thumb = await generate_thumbnail(file_path, thumb_path)
+                    new_sent = await client.send_file(
+                        BOT_USERNAME, file=file_path, text=new_caption,
+                        thumb=thumb_path if has_thumb else None,
+                        attributes=[DocumentAttributeVideo(duration=d, w=w, h=h)],
+                        reply_to=s_id # <--- 核心關鍵：回覆給舊訊息
+                    )
                 else:
-                    try:
-                        # 單純修改文字
-                        await client.edit_message(BOT_USERNAME, s_id, text=new_caption)
-                    except Exception as e:
-                        logger.error(f"Userbot 修改文字失敗: {e}")
+                    new_sent = await client.send_file(
+                        BOT_USERNAME, file=file_path, text=new_caption,
+                        reply_to=s_id
+                    )
+                # 將這則新回覆也加入 Map，以防未來又被編輯一次
+                userbot_msg_map[event.id].append(new_sent.id)
+            except Exception as e:
+                logger.error(f"Userbot 回覆修訂版媒體失敗: {e}")
+            finally:
+                # 嚴格保證本地檔案刪除
+                if os.path.exists(file_path): os.remove(file_path)
+                if os.path.exists(thumb_path): os.remove(thumb_path)
 
     async def process_single_message(client, msg):
         is_video, is_photo = bool(msg.video), bool(msg.photo)
@@ -490,7 +494,6 @@ async def run_userbot(bot_app: Application):
         except Exception as e:
             logger.error(f"單一媒體處理失敗: {e}")
         finally:
-            # 嚴格保證本地檔案刪除
             if os.path.exists(file_path): os.remove(file_path)
             if os.path.exists(thumb_path): os.remove(thumb_path)
 
@@ -538,19 +541,14 @@ async def run_userbot(bot_app: Application):
                     
             if input_media:
                 sent = await client.send_file(BOT_USERNAME, file=input_media, caption=caption)
-                # 確保映射時每一張圖對應正確的單一發送 ID，否則編輯時會誤覆蓋整個相簿
                 if isinstance(sent, list):
                     for idx, s in enumerate(sent):
-                        if idx < len(messages):
-                            userbot_msg_map[messages[idx].id] = [s.id]
+                        if idx < len(messages): userbot_msg_map[messages[idx].id] = [s.id]
                 else:
-                    for m in messages:
-                        userbot_msg_map[m.id] = [sent.id]
-
+                    for m in messages: userbot_msg_map[m.id] = [sent.id]
         except Exception as e:
             logger.error(f"相冊轉發失敗: {e}")
         finally:
-            # 嚴格保證本地檔案刪除
             for item in media_files:
                 if os.path.exists(item['file_path']): os.remove(item['file_path'])
                 if os.path.exists(item['thumb_path']): os.remove(item['thumb_path'])
@@ -562,8 +560,7 @@ def setup_userbot():
     os.makedirs(DATA_DIR, exist_ok=True)
     session_str = ""
     if os.path.exists(SESSION_TXT_PATH):
-        with open(SESSION_TXT_PATH, "r") as f:
-            session_str = f.read().strip()
+        with open(SESSION_TXT_PATH, "r") as f: session_string = f.read().strip()
 
     async def _do_auth():
         client = TelegramClient(StringSession(session_str), USERBOT_KEY, USERBOT_HASH)
@@ -608,8 +605,9 @@ def main():
     bot_app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     bot_app.add_handler(CommandHandler("start", start_command))
     bot_app.add_handler(CommandHandler("check", check_command))
-    bot_app.add_handler(MessageHandler(filters.User(USERBOT_LIST) & ~filters.UpdateType.EDITED, bot_inbox_handler))
-    bot_app.add_handler(MessageHandler(filters.User(USERBOT_LIST) & filters.UpdateType.EDITED, bot_edited_inbox_handler))
+    
+    # 全部統一交由 bot_inbox_handler 處理（不管是新圖還是用來回覆的修訂版）
+    bot_app.add_handler(MessageHandler(filters.User(USERBOT_LIST) & filters.ALL, bot_inbox_handler))
     
     logger.info("Telegram Bot 正在啟動…")
     bot_app.run_polling()
