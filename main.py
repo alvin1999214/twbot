@@ -5,9 +5,9 @@ import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 LAST_FORWARD_TIME    = "無記錄"
 LISTENING_GROUPS_INFO: dict = {}
+FORWARDING_ENABLED   = True
 
 # ================= Token-Bucket Rate Limiter ==================================
 class TokenBucket:
@@ -175,6 +176,9 @@ async def copy_album_with_retry(bot, from_chat_id: int, msg_ids: list, uid: int)
         uid,
     )
 
+async def send_text_with_retry(bot, text: str, uid: int) -> bool:
+    return await _safe_send(lambda: bot.send_message(chat_id=uid, text=text), uid)
+
 # ================= Two-level broadcast pipeline ===============================
 broadcast_queue: asyncio.Queue | None = None
 SENDER_POOL_SIZE = int(os.getenv("SENDER_POOL_SIZE", "1000"))
@@ -201,6 +205,8 @@ async def _sender_worker(uid: int, bot):
                     user_alive = await copy_album_with_retry(
                         bot, item["from_chat_id"], item["msg_ids"], uid
                     )
+                elif item["type"] == "text":
+                    user_alive = await send_text_with_retry(bot, item["text"], uid)
                 else:
                     user_alive = True
             except asyncio.CancelledError:
@@ -249,6 +255,8 @@ async def broadcast_dispatcher(bot):
                         "from_chat_id": job["from_chat_id"],
                         "msg_ids":      job["msg_ids"],
                     })
+                elif job_type == "text":
+                    await user_send_queues[uid].put({"type": "text", "text": job["text"]})
 
             broadcast_queue.task_done()
         except asyncio.CancelledError:
@@ -285,7 +293,8 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job_queue_size  = broadcast_queue.qsize() if broadcast_queue else 0
         status_msg = (
             f"🤖 Bot 狀態：運行中\n"
-            f"📅 上次轉發媒體：{LAST_FORWARD_TIME}\n"
+            f"� 轉發狀態：{'🟢 開啟' if FORWARDING_ENABLED else '🔴 關閉'}\n"
+            f"�📅 上次轉發媒體：{LAST_FORWARD_TIME}\n"
             f"📦 待發送媒體數：{job_queue_size}\n"
             f"⚡ TG車速速限：{GLOBAL_RATE_LIMIT} 條/秒\n\n"
             f"📡 正在跟車的群組：\n"
@@ -299,6 +308,67 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("請先輸入 /start 啟動機器人。")
 
+async def tell_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    # 驗證是否為管理員
+    if user_id not in USERBOT_LIST:
+        await update.message.reply_text("無權限使用此指令。")
+        return
+
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text("請在指令後方輸入要廣播的文字，例如：/tell 早上好")
+        return
+        
+    text_to_send = parts[1].strip()
+    
+    current_users = await get_latest_users_snapshot()
+    if not current_users:
+        await update.message.reply_text("目前沒有普通用戶可以發送。")
+        return
+        
+    await broadcast_queue.put({
+        "type": "text",
+        "text": text_to_send,
+        "users": current_users
+    })
+    
+    await update.message.reply_text(f"✅ 已將訊息加入廣播佇列，預計發送給 {len(current_users)} 位用戶。")
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in USERBOT_LIST:
+        await update.message.reply_text("無權限使用此指令。")
+        return
+
+    status_text = "🟢 開啟" if FORWARDING_ENABLED else "🔴 關閉"
+    keyboard = [
+        [InlineKeyboardButton(f"切換轉發狀態 (目前: {status_text})", callback_data="toggle_forward")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("🛠️ 管理員控制面板", reply_markup=reply_markup)
+
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id not in USERBOT_LIST:
+        await query.answer("無權限操作。", show_alert=True)
+        return
+
+    if query.data == "toggle_forward":
+        global FORWARDING_ENABLED
+        FORWARDING_ENABLED = not FORWARDING_ENABLED
+        
+        status_text = "🟢 開啟" if FORWARDING_ENABLED else "🔴 關閉"
+        keyboard = [
+            [InlineKeyboardButton(f"切換轉發狀態 (目前: {status_text})", callback_data="toggle_forward")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_reply_markup(reply_markup=reply_markup)
+        await query.answer(f"轉發狀態已更改為: {'開啟' if FORWARDING_ENABLED else '關閉'}")
+
 # ================= Bot inbox handler (producer) ==============================
 ptb_media_cache: dict = {}
 ptb_cache_lock: asyncio.Lock | None = None
@@ -308,7 +378,10 @@ async def bot_inbox_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or not msg.effective_attachment:
         return
 
-    global LAST_FORWARD_TIME
+    global LAST_FORWARD_TIME, FORWARDING_ENABLED
+    if not FORWARDING_ENABLED:
+        return
+        
     hkt_tz = timezone(timedelta(hours=8))
     LAST_FORWARD_TIME = datetime.now(hkt_tz).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -475,6 +548,9 @@ def main():
     )
     bot_app.add_handler(CommandHandler("start", start_command))
     bot_app.add_handler(CommandHandler("check", check_command))
+    bot_app.add_handler(CommandHandler("tell", tell_command))
+    bot_app.add_handler(CommandHandler("admin", admin_command))
+    bot_app.add_handler(CallbackQueryHandler(admin_callback))
     bot_app.add_handler(
         MessageHandler(filters.User(USERBOT_LIST) & filters.ALL, bot_inbox_handler)
     )
