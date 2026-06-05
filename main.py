@@ -293,8 +293,8 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         job_queue_size  = broadcast_queue.qsize() if broadcast_queue else 0
         status_msg = (
             f"🤖 Bot 狀態：運行中\n"
-            f"� 轉發狀態：{'🟢 開啟' if FORWARDING_ENABLED else '🔴 關閉'}\n"
-            f"�📅 上次轉發媒體：{LAST_FORWARD_TIME}\n"
+            f"🔄 轉發狀態：{'🟢 開啟' if FORWARDING_ENABLED else '🔴 關閉'}\n"
+            f"📅 上次轉發媒體：{LAST_FORWARD_TIME}\n"
             f"📦 待發送媒體數：{job_queue_size}\n"
             f"⚡ TG車速速限：{GLOBAL_RATE_LIMIT} 條/秒\n\n"
             f"📡 正在跟車的群組：\n"
