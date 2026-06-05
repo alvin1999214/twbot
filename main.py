@@ -9,6 +9,7 @@ from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import DocumentAttributeVideo, InputMediaUploadedDocument, InputMediaUploadedPhoto
 
 load_dotenv()
 
@@ -19,6 +20,7 @@ USERBOT_HASH     = os.getenv("USERBOT_HASH")
 
 USERBOT_LIST     = [int(x.strip()) for x in os.getenv("USERBOT_LIST",     "").split(",") if x.strip()]
 LISTENING_GROUPS = [int(x.strip()) for x in os.getenv("LISTENING_GROUPS", "").split(",") if x.strip()]
+WHITELIST_USERS  = [int(x.strip()) for x in os.getenv("WHITELIST_USERS", "").split(",") if x.strip()]
 
 DATA_DIR          = "/app/data"
 USERS_JSON_PATH   = os.path.join(DATA_DIR, "users.json")
@@ -347,6 +349,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/check - 檢查機器人狀態及正在監聽的群組"
         )
         return
+        
+    if WHITELIST_USERS and user_id not in WHITELIST_USERS:
+        await update.message.reply_text("抱歉，您不在白名單內，無法接收轉發的媒體。")
+        return
+
     added = await add_normal_user(user_id)
     if added:
         logger.info(f"新普通用戶加入: {user_id}")
@@ -430,6 +437,164 @@ async def process_ptb_album(from_chat_id: int, gid: str, bot):
     })
 
 # ================= Userbot listener ==========================================
+async def get_video_metadata(video_path: str):
+    width, height, duration = 0, 0, 0
+    thumb_path = None
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration",
+            "-of", "json", video_path
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        stdout, _ = await process.communicate()
+        if stdout:
+            data = json.loads(stdout)
+            streams = data.get("streams", [])
+            if streams:
+                stream = streams[0]
+                width = int(stream.get("width", 0))
+                height = int(stream.get("height", 0))
+                duration = int(float(stream.get("duration", 0)))
+        
+        thumb_path = video_path + ".jpg"
+        cmd2 = [
+            "ffmpeg", "-y", "-i", video_path,
+            "-ss", "00:00:00.000", "-vframes", "1",
+            "-vf", "scale=320:-1",
+            thumb_path
+        ]
+        process2 = await asyncio.create_subprocess_exec(
+            *cmd2, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await process2.communicate()
+        
+        if not os.path.exists(thumb_path):
+            thumb_path = None
+            
+    except Exception as e:
+        logger.error(f"提取影片 metadata 失敗: {e}")
+        
+    return width, height, duration, thumb_path
+
+async def get_custom_caption(message, is_edited: bool) -> str:
+    original_text = message.text or ""
+    try:
+        sender = await message.get_sender()
+        sender_id = sender.id if sender else "未知"
+        if sender and getattr(sender, 'username', None):
+            username = f"@{sender.username}"
+        else:
+            username = "用戶未設定username"
+    except Exception:
+        sender_id = "未知"
+        username = "用戶未設定username"
+
+    tag = "#已編輯" if is_edited else "#原始圖片"
+
+    addition = f"\n\n發送者ID: {sender_id}\n發送者: {username}\n媒體信息: {tag}"
+    return original_text + addition
+
+async def process_restricted_message(client, message, custom_caption: str):
+    path = await client.download_media(message, file=DATA_DIR)
+    if not path:
+        return
+    files_to_delete = [path]
+    try:
+        if message.video or message.gif:
+            width, height, duration, thumb_path = await get_video_metadata(path)
+            if thumb_path:
+                files_to_delete.append(thumb_path)
+            
+            await client.send_file(
+                BOT_USERNAME,
+                path,
+                caption=custom_caption,
+                attributes=[DocumentAttributeVideo(
+                    duration=duration,
+                    w=width,
+                    h=height,
+                    supports_streaming=True
+                )],
+                thumb=thumb_path
+            )
+        else:
+            await client.send_file(BOT_USERNAME, path, caption=custom_caption)
+    except Exception as e:
+        logger.error(f"Userbot 單一媒體下載轉發失敗: {e}")
+    finally:
+        for f in files_to_delete:
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
+async def process_restricted_album(client, messages, custom_caption: str):
+    media_list = []
+    files_to_delete = []
+    
+    try:
+        for msg in messages:
+            path = await client.download_media(msg, file=DATA_DIR)
+            if not path:
+                continue
+            files_to_delete.append(path)
+            
+            uploaded_file = await client.upload_file(path)
+            
+            if msg.video or msg.gif:
+                width, height, duration, thumb_path = await get_video_metadata(path)
+                if thumb_path:
+                    files_to_delete.append(thumb_path)
+                    uploaded_thumb = await client.upload_file(thumb_path)
+                else:
+                    uploaded_thumb = None
+                    
+                mime_type = "video/mp4"
+                media_list.append(
+                    InputMediaUploadedDocument(
+                        file=uploaded_file,
+                        mime_type=mime_type,
+                        attributes=[DocumentAttributeVideo(
+                            duration=duration,
+                            w=width,
+                            h=height,
+                            supports_streaming=True
+                        )],
+                        thumb=uploaded_thumb,
+                        force_file=False
+                    )
+                )
+            elif getattr(msg, 'photo', None):
+                media_list.append(
+                    InputMediaUploadedPhoto(
+                        file=uploaded_file
+                    )
+                )
+            else:
+                media_list.append(
+                    InputMediaUploadedDocument(
+                        file=uploaded_file,
+                        mime_type=msg.file.mime_type if getattr(msg, 'file', None) else "application/octet-stream",
+                        force_file=True
+                    )
+                )
+                
+        if media_list:
+            await client.send_file(BOT_USERNAME, media_list, caption=custom_caption)
+    except Exception as e:
+        logger.error(f"Userbot 相冊下載轉發失敗: {e}")
+    finally:
+        for f in files_to_delete:
+            if f and os.path.exists(f):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+
 media_groups_cache: dict = {}
 cache_lock = asyncio.Lock()
 
@@ -466,8 +631,7 @@ async def run_userbot(bot_app: Application):
             logger.error(f"獲取群組 {group_id} 資訊失敗: {e}")
             LISTENING_GROUPS_INFO[group_id] = "未知群組"
 
-    @client.on(events.NewMessage(chats=LISTENING_GROUPS))
-    async def handler(event):
+    async def handle_media_event(client, event, is_edited: bool):
         if not event.message.media or event.message.sticker:
             return
 
@@ -475,26 +639,46 @@ async def run_userbot(bot_app: Application):
 
         if media_group_id is None:
             try:
-                await client.forward_messages(BOT_USERNAME, event.message)
+                chat = await event.get_chat()
+                custom_caption = await get_custom_caption(event.message, is_edited)
+                if getattr(chat, 'noforwards', False):
+                    await process_restricted_message(client, event.message, custom_caption)
+                else:
+                    await client.send_file(BOT_USERNAME, event.message.media, caption=custom_caption)
             except Exception as e:
-                logger.error(f"Userbot 單圖轉發至 Bot 失敗: {e}")
+                logger.error(f"Userbot 單一媒體轉發至 Bot 失敗: {e}")
         else:
+            cache_key = f"{media_group_id}_{'edit' if is_edited else 'new'}"
             async with cache_lock:
-                if media_group_id not in media_groups_cache:
-                    media_groups_cache[media_group_id] = []
+                if cache_key not in media_groups_cache:
+                    media_groups_cache[cache_key] = []
                     asyncio.create_task(
-                        process_media_group(client, media_group_id)
+                        process_media_group(client, cache_key, is_edited)
                     )
-                media_groups_cache[media_group_id].append(event.message)
+                media_groups_cache[cache_key].append(event.message)
 
-    async def process_media_group(client, media_group_id):
+    @client.on(events.NewMessage(chats=LISTENING_GROUPS))
+    async def new_message_handler(event):
+        await handle_media_event(client, event, is_edited=False)
+
+    @client.on(events.MessageEdited(chats=LISTENING_GROUPS))
+    async def edited_message_handler(event):
+        await handle_media_event(client, event, is_edited=True)
+
+    async def process_media_group(client, cache_key, is_edited):
         await asyncio.sleep(0.8)
         async with cache_lock:
-            messages = media_groups_cache.pop(media_group_id, [])
+            messages = media_groups_cache.pop(cache_key, [])
         if messages:
             messages.sort(key=lambda x: x.id)
             try:
-                await client.forward_messages(BOT_USERNAME, messages)
+                chat = await messages[0].get_chat()
+                custom_caption = await get_custom_caption(messages[0], is_edited)
+                if getattr(chat, 'noforwards', False):
+                    await process_restricted_album(client, messages, custom_caption)
+                else:
+                    media_list = [m.media for m in messages]
+                    await client.send_file(BOT_USERNAME, media_list, caption=custom_caption)
             except Exception as e:
                 logger.error(f"Userbot 相冊轉發至 Bot 失敗: {e}")
 
