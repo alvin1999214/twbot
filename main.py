@@ -436,31 +436,36 @@ async def run_userbot(bot_app: Application):
     logger.info("Userbot 已成功啟動，正在監聽群組…")
 
     global LISTENING_GROUPS_INFO
+    valid_listening_groups = []
     for group_id in LISTENING_GROUPS:
         try:
             entity = await client.get_entity(group_id)
             LISTENING_GROUPS_INFO[group_id] = getattr(entity, "title", str(group_id))
+            valid_listening_groups.append(group_id)
         except Exception as e:
             logger.error(f"獲取群組 {group_id} 資訊失敗: {e}")
             LISTENING_GROUPS_INFO[group_id] = "未知群組"
 
-    @client.on(events.NewMessage(chats=LISTENING_GROUPS))
-    async def handler(event):
-        if not event.message.media or event.message.sticker:
-            return
+    if valid_listening_groups:
+        @client.on(events.NewMessage(chats=valid_listening_groups))
+        async def handler(event):
+            if not event.message.media or event.message.sticker:
+                return
 
-        media_group_id = event.message.grouped_id
-        if media_group_id is None:
-            try:
-                await client.forward_messages(BOT_USERNAME, event.message)
-            except Exception as e:
-                logger.error(f"Userbot 單圖轉發至 Bot 失敗: {e}")
-        else:
-            async with cache_lock:
-                if media_group_id not in media_groups_cache:
-                    media_groups_cache[media_group_id] = []
-                    asyncio.create_task(process_media_group(client, media_group_id))
-                media_groups_cache[media_group_id].append(event.message)
+            media_group_id = event.message.grouped_id
+            if media_group_id is None:
+                try:
+                    await client.forward_messages(BOT_USERNAME, event.message)
+                except Exception as e:
+                    logger.error(f"Userbot 單圖轉發至 Bot 失敗: {e}")
+            else:
+                async with cache_lock:
+                    if media_group_id not in media_groups_cache:
+                        media_groups_cache[media_group_id] = []
+                        asyncio.create_task(process_media_group(client, media_group_id))
+                    media_groups_cache[media_group_id].append(event.message)
+    else:
+        logger.warning("無有效的監聽群組，Userbot 暫時不會監聽任何新訊息。")
 
     async def process_media_group(client, media_group_id):
         await asyncio.sleep(0.8)
