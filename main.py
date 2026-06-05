@@ -454,6 +454,9 @@ def main():
     # 啟動前強制檢查並處理 Userbot 授權
     setup_userbot()
 
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     bot_app = (
         Application.builder()
         .token(BOT_TOKEN)
