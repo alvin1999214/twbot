@@ -335,8 +335,12 @@ async def broadcast_dispatcher(bot):
 
             broadcast_queue.task_done()
 
+        except asyncio.CancelledError:
+            logger.info("廣播調度器已停止 (取消)。")
+            break
         except Exception as e:
             logger.error(f"廣播調度器錯誤: {e}")
+            await asyncio.sleep(1)
 
 # ================= Bot command handlers ======================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -611,21 +615,8 @@ async def run_userbot(bot_app: Application):
     await client.connect()
 
     if not await client.is_user_authorized():
-        logger.info("Userbot 未授權！即將進入互動式登入流程...")
-        
-        async def async_input(prompt: str) -> str:
-            loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, input, prompt)
-            
-        try:
-            await client.start(
-                phone=lambda: async_input("📱 請輸入手機號碼 (包含國碼，如 +886...): "),
-                password=lambda: async_input("🔑 請輸入兩步驗證密碼 (若無請直接 Enter): "),
-                code_callback=lambda: async_input("💬 請輸入 Telegram 收到的驗證碼: ")
-            )
-        except Exception as e:
-            logger.error(f"Userbot 登入失敗: {e}")
-            return
+        logger.error("Userbot 尚未授權或授權已失效！請重新啟動程式進行認證。")
+        return
 
     # Persist refreshed session
     with open(SESSION_TXT_PATH, "w") as f:
@@ -706,8 +697,48 @@ async def post_init(application: Application):
     # Userbot listener
     application.create_task(run_userbot(application))
 
+def authenticate_userbot():
+    session_string = ""
+    if os.path.exists(SESSION_TXT_PATH):
+        with open(SESSION_TXT_PATH, "r") as f:
+            session_string = f.read().strip()
+
+    client = TelegramClient(StringSession(session_string), USERBOT_KEY, USERBOT_HASH)
+
+    async def do_auth():
+        await client.connect()
+        if not await client.is_user_authorized():
+            logger.info("Userbot 未授權！即將進入互動式登入流程...")
+            try:
+                await client.start(
+                    phone=lambda: input("📱 請輸入手機號碼 (包含國碼，如 +886...): "),
+                    password=lambda: input("🔑 請輸入兩步驗證密碼 (若無請直接 Enter): "),
+                    code_callback=lambda: input("💬 請輸入 Telegram 收到的驗證碼: ")
+                )
+                with open(SESSION_TXT_PATH, "w") as f:
+                    f.write(client.session.save())
+                logger.info("Userbot 登入成功！")
+            except EOFError:
+                logger.error("終端機無互動模式！首次登入請務必使用指令: docker compose run -it --rm tg_bot")
+                raise
+        await client.disconnect()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(do_auth())
+    finally:
+        loop.close()
+
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
+    
+    try:
+        authenticate_userbot()
+    except Exception as e:
+        logger.error(f"Userbot 登入過程發生錯誤: {e}")
+        return
+        
     bot_app = (
         Application.builder()
         .token(BOT_TOKEN)
