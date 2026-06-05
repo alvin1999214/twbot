@@ -8,7 +8,7 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
-from telegram.ext import Application, CommandHandler, MessageHandler, EditedMessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -595,7 +595,7 @@ def main():
     # 處理來自 Userbot 傳給 Bot 的新訊息，進行廣播
     bot_app.add_handler(MessageHandler(filters.User(USERBOT_LIST) & filters.ALL, bot_inbox_handler))
     # 攔截來自 Userbot 修改過的 Caption，並同步修改廣播出去的訊息
-    bot_app.add_handler(EditedMessageHandler(filters.User(USERBOT_LIST) & filters.ALL, bot_edited_inbox_handler))
+    bot_app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.User(USERBOT_LIST), bot_edited_inbox_handler))
     
     logger.info("Telegram Bot 正在啟動…")
     bot_app.run_polling()
