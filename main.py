@@ -611,10 +611,21 @@ async def run_userbot(bot_app: Application):
     await client.connect()
 
     if not await client.is_user_authorized():
-        logger.error(
-            "Userbot 未授權！請將有效 Session 字串存入 userbot_session.txt 後重啟。"
-        )
-        return
+        logger.info("Userbot 未授權！即將進入互動式登入流程...")
+        
+        async def async_input(prompt: str) -> str:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, input, prompt)
+            
+        try:
+            await client.start(
+                phone=lambda: async_input("📱 請輸入手機號碼 (包含國碼，如 +886...): "),
+                password=lambda: async_input("🔑 請輸入兩步驗證密碼 (若無請直接 Enter): "),
+                code_callback=lambda: async_input("💬 請輸入 Telegram 收到的驗證碼: ")
+            )
+        except Exception as e:
+            logger.error(f"Userbot 登入失敗: {e}")
+            return
 
     # Persist refreshed session
     with open(SESSION_TXT_PATH, "w") as f:
