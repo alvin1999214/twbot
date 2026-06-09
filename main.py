@@ -27,6 +27,7 @@ SESSION_TXT_PATH  = os.path.join(DATA_DIR, "userbot_session.txt")
 MAX_SEND_RETRIES  = int(os.getenv("MAX_SEND_RETRIES",  "3"))
 
 GLOBAL_RATE_LIMIT = int(os.getenv("GLOBAL_RATE_LIMIT", "25"))
+USERBOT_RECONNECT_DELAY = int(os.getenv("USERBOT_RECONNECT_DELAY", "5"))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -420,59 +421,7 @@ cache_lock: asyncio.Lock | None = None
 
 async def run_userbot(bot_app: Application):
     os.chdir(DATA_DIR)
-    session_string = ""
-    if os.path.exists(SESSION_TXT_PATH):
-        with open(SESSION_TXT_PATH, "r") as f:
-            session_string = f.read().strip()
-
-    client = TelegramClient(StringSession(session_string), USERBOT_KEY, USERBOT_HASH)
-    await client.connect()
-
-    if not await client.is_user_authorized():
-        logger.error("Userbot 失效或尚未授權！請先使用 docker compose run --rm -it tg_bot 進行互動登入。")
-        await client.disconnect()
-        return
-
-    logger.info("Userbot 已成功啟動，正在監聽群組…")
-
-    # 喚醒對話與 PTS (Projected Telegram State) 狀態
-    # 告訴伺服器這個 Session 是活躍的，以解決「必須打開官方 App 才能收到推播」的問題
-    try:
-        await client.get_dialogs(limit=10)
-    except Exception as e:
-        logger.warning(f"Userbot 同步對話列表失敗: {e}")
-
     global LISTENING_GROUPS_INFO
-    valid_listening_groups = []
-    for group_id in LISTENING_GROUPS:
-        try:
-            entity = await client.get_entity(group_id)
-            LISTENING_GROUPS_INFO[group_id] = getattr(entity, "title", str(group_id))
-            valid_listening_groups.append(group_id)
-        except Exception as e:
-            logger.error(f"獲取群組 {group_id} 資訊失敗: {e}")
-            LISTENING_GROUPS_INFO[group_id] = "未知群組"
-
-    if valid_listening_groups:
-        @client.on(events.NewMessage(chats=valid_listening_groups))
-        async def handler(event):
-            if not event.message.media or event.message.sticker:
-                return
-
-            media_group_id = event.message.grouped_id
-            if media_group_id is None:
-                try:
-                    await client.forward_messages(BOT_USERNAME, event.message)
-                except Exception as e:
-                    logger.error(f"Userbot 單圖轉發至 Bot 失敗: {e}")
-            else:
-                async with cache_lock:
-                    if media_group_id not in media_groups_cache:
-                        media_groups_cache[media_group_id] = []
-                        asyncio.create_task(process_media_group(client, media_group_id))
-                    media_groups_cache[media_group_id].append(event.message)
-    else:
-        logger.warning("無有效的監聽群組，Userbot 暫時不會監聽任何新訊息。")
 
     async def process_media_group(client, media_group_id):
         await asyncio.sleep(0.8)
@@ -485,7 +434,95 @@ async def run_userbot(bot_app: Application):
             except Exception as e:
                 logger.error(f"Userbot 相冊轉發至 Bot 失敗: {e}")
 
-    await client.run_until_disconnected()
+    while True:
+        session_string = ""
+        if os.path.exists(SESSION_TXT_PATH):
+            with open(SESSION_TXT_PATH, "r", encoding="utf-8") as f:
+                session_string = f.read().strip()
+
+        client = TelegramClient(
+            StringSession(session_string),
+            USERBOT_KEY,
+            USERBOT_HASH,
+            catch_up=True,
+        )
+
+        try:
+            await client.connect()
+
+            if not await client.is_user_authorized():
+                logger.error("Userbot 失效或尚未授權！請先使用 docker compose run --rm -it tg_bot 進行互動登入。")
+                return
+
+            logger.info("Userbot 已連線，正在初始化監聽群組…")
+
+            # 先同步常用對話與更新狀態，再註冊事件處理器並補抓離線更新。
+            try:
+                await client.get_dialogs(limit=10)
+            except Exception as e:
+                logger.warning(f"Userbot 同步對話列表失敗: {e}")
+
+            valid_listening_groups = []
+            for group_id in LISTENING_GROUPS:
+                try:
+                    entity = await client.get_entity(group_id)
+                    LISTENING_GROUPS_INFO[group_id] = getattr(entity, "title", str(group_id))
+                    valid_listening_groups.append(group_id)
+                except Exception as e:
+                    logger.error(f"獲取群組 {group_id} 資訊失敗: {e}")
+                    LISTENING_GROUPS_INFO[group_id] = "未知群組"
+
+            if valid_listening_groups:
+                @client.on(events.NewMessage(chats=valid_listening_groups))
+                async def handler(event):
+                    if not event.message.media or event.message.sticker:
+                        return
+
+                    media_group_id = event.message.grouped_id
+                    if media_group_id is None:
+                        try:
+                            await client.forward_messages(BOT_USERNAME, event.message)
+                        except Exception as e:
+                            logger.error(f"Userbot 單圖轉發至 Bot 失敗: {e}")
+                    else:
+                        async with cache_lock:
+                            if media_group_id not in media_groups_cache:
+                                media_groups_cache[media_group_id] = []
+                                asyncio.create_task(process_media_group(client, media_group_id))
+                            media_groups_cache[media_group_id].append(event.message)
+            else:
+                logger.warning("無有效的監聽群組，Userbot 暫時不會監聽任何新訊息。")
+
+            try:
+                await client.set_receive_updates(True)
+            except Exception as e:
+                logger.warning(f"Userbot 無法明確開啟更新接收: {e}")
+
+            try:
+                await client.catch_up()
+            except Exception as e:
+                logger.warning(f"Userbot 補抓離線更新失敗: {e}")
+
+            logger.info("Userbot 已成功啟動，正在監聽群組…")
+            await client.run_until_disconnected()
+            logger.warning("Userbot 連線已結束，%s 秒後嘗試重連…", USERBOT_RECONNECT_DELAY)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Userbot 發生錯誤，%s 秒後重連: %s", USERBOT_RECONNECT_DELAY, e)
+        finally:
+            try:
+                if client.session is not None:
+                    with open(SESSION_TXT_PATH, "w", encoding="utf-8") as f:
+                        f.write(client.session.save())
+            except Exception as e:
+                logger.warning(f"儲存 Userbot session 失敗: {e}")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+        await asyncio.sleep(USERBOT_RECONNECT_DELAY)
 
 # ================= Application bootstrap =====================================
 
