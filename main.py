@@ -435,6 +435,13 @@ async def run_userbot(bot_app: Application):
 
     logger.info("Userbot 已成功啟動，正在監聽群組…")
 
+    # 喚醒對話與 PTS (Projected Telegram State) 狀態
+    # 告訴伺服器這個 Session 是活躍的，以解決「必須打開官方 App 才能收到推播」的問題
+    try:
+        await client.get_dialogs(limit=10)
+    except Exception as e:
+        logger.warning(f"Userbot 同步對話列表失敗: {e}")
+
     global LISTENING_GROUPS_INFO
     valid_listening_groups = []
     for group_id in LISTENING_GROUPS:
