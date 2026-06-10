@@ -483,6 +483,10 @@ async def run_userbot(bot_app: Application):
                         msgs = await client.get_messages(group_id, limit=1)
                         if msgs:
                             last_message_ids[group_id] = msgs[0].id
+                            try:
+                                await client.send_read_acknowledge(group_id, max_id=msgs[0].id)
+                            except Exception as e:
+                                logger.debug(f"初始標記已讀失敗 {group_id}: {e}")
                         else:
                             last_message_ids[group_id] = 0
                     except Exception as e:
@@ -518,6 +522,12 @@ async def run_userbot(bot_app: Application):
                     last_message_ids[group_id] = max(last_message_ids.get(group_id, 0), msg.id)
                     
                     await handle_new_media_message(msg)
+                    
+                    # 激進已讀：收到推播立刻標記為已讀
+                    try:
+                        await client.send_read_acknowledge(group_id, max_id=msg.id)
+                    except Exception as e:
+                        logger.debug(f"Userbot 即時標記已讀失敗: {e}")
 
                 async def force_poll_updates():
                     """主動輪詢群組新消息，防止 Telethon 收不到推播"""
@@ -528,11 +538,18 @@ async def run_userbot(bot_app: Application):
                                 if last_id > 0:
                                     messages = await client.get_messages(group_id, min_id=last_id, limit=20)
                                     if messages:
+                                        latest_msg_id = messages[0].id
                                         # get_messages 默認返回從新到舊，反轉為從舊到新處理
                                         for msg in reversed(messages):
                                             if msg.id > last_message_ids.get(group_id, 0):
                                                 last_message_ids[group_id] = max(last_message_ids.get(group_id, 0), msg.id)
                                                 await handle_new_media_message(msg)
+                                                
+                                        # 輪詢抓取到新訊息後，也保證標記為已讀
+                                        try:
+                                            await client.send_read_acknowledge(group_id, max_id=latest_msg_id)
+                                        except Exception as e:
+                                            logger.debug(f"Userbot 輪詢標記已讀失敗: {e}")
                             except asyncio.CancelledError:
                                 break
                             except Exception as e:
