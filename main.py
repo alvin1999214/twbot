@@ -4,26 +4,23 @@ import json
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
-load_dotenv()
-
 BOT_TOKEN        = os.getenv("BOT_TOKEN")
 BOT_USERNAME     = os.getenv("BOT_USERNAME")
 USERBOT_KEY      = int(os.getenv("USERBOT_KEY"))
 USERBOT_HASH     = os.getenv("USERBOT_HASH")
+USERBOT_SESSION  = os.getenv("USERBOT_SESSION", "")
 
 USERBOT_LIST     = [int(x.strip()) for x in os.getenv("USERBOT_LIST",     "").split(",") if x.strip()]
 LISTENING_GROUPS = [int(x.strip()) for x in os.getenv("LISTENING_GROUPS", "").split(",") if x.strip()]
 
 DATA_DIR          = "/app/data"
 USERS_JSON_PATH   = os.path.join(DATA_DIR, "users.json")
-SESSION_TXT_PATH  = os.path.join(DATA_DIR, "userbot_session.txt")
 MAX_SEND_RETRIES  = int(os.getenv("MAX_SEND_RETRIES",  "3"))
 
 GLOBAL_RATE_LIMIT = int(os.getenv("GLOBAL_RATE_LIMIT", "25"))
@@ -435,13 +432,8 @@ async def run_userbot(bot_app: Application):
                 logger.error(f"Userbot 相冊轉發至 Bot 失敗: {e}")
 
     while True:
-        session_string = ""
-        if os.path.exists(SESSION_TXT_PATH):
-            with open(SESSION_TXT_PATH, "r", encoding="utf-8") as f:
-                session_string = f.read().strip()
-
         client = TelegramClient(
-            StringSession(session_string),
+            StringSession(USERBOT_SESSION),
             USERBOT_KEY,
             USERBOT_HASH,
             catch_up=True,
@@ -451,7 +443,7 @@ async def run_userbot(bot_app: Application):
             await client.connect()
 
             if not await client.is_user_authorized():
-                logger.error("Userbot 失效或尚未授權！請先使用 docker compose run --rm -it tg_bot 進行互動登入。")
+                logger.error("Userbot 失效或尚未授權！請重新使用本地 login.py 獲取新的 USERBOT_SESSION，並更新至 docker-compose.yml。")
                 return
 
             logger.info("Userbot 已連線，正在初始化監聽群組…")
@@ -600,12 +592,6 @@ async def run_userbot(bot_app: Application):
             logger.error("Userbot 發生錯誤，%s 秒後重連: %s", USERBOT_RECONNECT_DELAY, e)
         finally:
             try:
-                if client.session is not None:
-                    with open(SESSION_TXT_PATH, "w", encoding="utf-8") as f:
-                        f.write(client.session.save())
-            except Exception as e:
-                logger.warning(f"儲存 Userbot session 失敗: {e}")
-            try:
                 await client.disconnect()
             except Exception:
                 pass
@@ -613,39 +599,6 @@ async def run_userbot(bot_app: Application):
         await asyncio.sleep(USERBOT_RECONNECT_DELAY)
 
 # ================= Application bootstrap =====================================
-
-def setup_userbot():
-    """
-    預先互動式授權流程，在進入 PTB 主程序前獨立完成。
-    """
-    os.makedirs(DATA_DIR, exist_ok=True)
-    session_str = ""
-    if os.path.exists(SESSION_TXT_PATH):
-        with open(SESSION_TXT_PATH, "r") as f:
-            session_str = f.read().strip()
-
-    async def _do_auth():
-        client = TelegramClient(StringSession(session_str), USERBOT_KEY, USERBOT_HASH)
-        await client.connect()
-        if not await client.is_user_authorized():
-            print("\n" + "="*50)
-            print("⚠️  Userbot 尚未授權，進入互動登入模式  ⚠️")
-            print("請依照提示輸入手機號碼與驗證碼 (如果有 2FA 也會要求輸入)")
-            print("="*50 + "\n")
-            await client.start()
-            print("\n✅ Userbot 授權成功！正在儲存 Session...\n")
-            with open(SESSION_TXT_PATH, "w") as f:
-                f.write(client.session.save())
-        await client.disconnect()
-
-    try:
-        asyncio.run(_do_auth())
-    except EOFError:
-        print("\n❌ 錯誤：無法讀取終端機輸入。請確保執行時加上 -it 參數 (例如：docker compose run --rm -it tg_bot)")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n❌ Userbot 登入發生未預期錯誤: {e}")
-        sys.exit(1)
 
 bg_tasks = set()
 
@@ -671,9 +624,6 @@ async def post_init(application: Application):
     userbot_task.add_done_callback(bg_tasks.discard)
 
 def main():
-    # 啟動前強制檢查並處理 Userbot 授權
-    setup_userbot()
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 

@@ -1,13 +1,24 @@
 version: '3.8'
 
 services:
-  tg_bot:
+  twbot:
     build: .
-    container_name: tg_forward_bot
-    restart: always
-    # 強制使用 UID 1000 運行，確保掛載到主機的 data 權限與 opc/ubuntu 一致
-    user: "1001:1001"
+    # image: twbot_image:latest # (若不使用 Dockerfile 構建，請自行更改為對應 image)
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=your_bot_token_here
+      - BOT_USERNAME=your_bot_username
+      - USERBOT_KEY=your_api_id_here
+      - USERBOT_HASH=your_api_hash_here
+      - USERBOT_SESSION=your_session_string_generated_from_login_py
+      
+      # 列表格式請用逗號分隔，例如: 12345678,87654321
+      - USERBOT_LIST=
+      - LISTENING_GROUPS=
+      
+      - MAX_SEND_RETRIES=3
+      - GLOBAL_RATE_LIMIT=25
+      - USERBOT_RECONNECT_DELAY=5
+      - SENDER_POOL_SIZE=1000
     volumes:
       - ./data:/app/data
-    env_file:
-      - .env
