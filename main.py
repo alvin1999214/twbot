@@ -472,16 +472,31 @@ async def run_userbot(bot_app: Application):
                     logger.error(f"獲取群組 {group_id} 資訊失敗: {e}")
                     LISTENING_GROUPS_INFO[group_id] = "未知群組"
 
+            poll_task = None
+
             if valid_listening_groups:
-                @client.on(events.NewMessage(chats=valid_listening_groups))
-                async def handler(event):
-                    if not event.message.media or event.message.sticker:
+                last_message_ids = {}
+                
+                # 初始化每個群組的最新消息 ID
+                for group_id in valid_listening_groups:
+                    try:
+                        msgs = await client.get_messages(group_id, limit=1)
+                        if msgs:
+                            last_message_ids[group_id] = msgs[0].id
+                        else:
+                            last_message_ids[group_id] = 0
+                    except Exception as e:
+                        logger.debug(f"獲取群組 {group_id} 最新消息失敗: {e}")
+                        last_message_ids[group_id] = 0
+
+                async def handle_new_media_message(msg):
+                    if not msg.media or msg.sticker:
                         return
 
-                    media_group_id = event.message.grouped_id
+                    media_group_id = msg.grouped_id
                     if media_group_id is None:
                         try:
-                            await client.forward_messages(BOT_USERNAME, event.message)
+                            await client.forward_messages(BOT_USERNAME, msg)
                         except Exception as e:
                             logger.error(f"Userbot 單圖轉發至 Bot 失敗: {e}")
                     else:
@@ -489,7 +504,42 @@ async def run_userbot(bot_app: Application):
                             if media_group_id not in media_groups_cache:
                                 media_groups_cache[media_group_id] = []
                                 asyncio.create_task(process_media_group(client, media_group_id))
-                            media_groups_cache[media_group_id].append(event.message)
+                            # 避免重複加入
+                            if not any(m.id == msg.id for m in media_groups_cache[media_group_id]):
+                                media_groups_cache[media_group_id].append(msg)
+
+                @client.on(events.NewMessage(chats=valid_listening_groups))
+                async def handler(event):
+                    group_id = event.chat_id
+                    msg = event.message
+
+                    if group_id in last_message_ids and msg.id <= last_message_ids.get(group_id, 0):
+                        return
+                    last_message_ids[group_id] = max(last_message_ids.get(group_id, 0), msg.id)
+                    
+                    await handle_new_media_message(msg)
+
+                async def force_poll_updates():
+                    """主動輪詢群組新消息，防止 Telethon 收不到推播"""
+                    while client.is_connected():
+                        for group_id in valid_listening_groups:
+                            try:
+                                last_id = last_message_ids.get(group_id, 0)
+                                if last_id > 0:
+                                    messages = await client.get_messages(group_id, min_id=last_id, limit=20)
+                                    if messages:
+                                        # get_messages 默認返回從新到舊，反轉為從舊到新處理
+                                        for msg in reversed(messages):
+                                            if msg.id > last_message_ids.get(group_id, 0):
+                                                last_message_ids[group_id] = max(last_message_ids.get(group_id, 0), msg.id)
+                                                await handle_new_media_message(msg)
+                            except asyncio.CancelledError:
+                                break
+                            except Exception as e:
+                                logger.debug(f"主動輪詢群組 {group_id} 失敗: {e}")
+                        await asyncio.sleep(10)  # 每 10 秒檢查一次
+                
+                poll_task = asyncio.create_task(force_poll_updates())
             else:
                 logger.warning("無有效的監聽群組，Userbot 暫時不會監聽任何新訊息。")
 
@@ -523,6 +573,8 @@ async def run_userbot(bot_app: Application):
                 await client.run_until_disconnected()
             finally:
                 keep_alive_task.cancel()
+                if poll_task:
+                    poll_task.cancel()
                 
             logger.warning("Userbot 連線已結束，%s 秒後嘗試重連…", USERBOT_RECONNECT_DELAY)
         except asyncio.CancelledError:
