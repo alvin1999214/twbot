@@ -1,0 +1,7 @@
+# 忽略真實的設定檔與環境變數檔
+docker-compose.yml
+.env
+
+# 忽略資料儲存目錄與 Python 快取
+/data/
+__pycache__/
