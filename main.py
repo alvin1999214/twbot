@@ -504,7 +504,26 @@ async def run_userbot(bot_app: Application):
                 logger.warning(f"Userbot 補抓離線更新失敗: {e}")
 
             logger.info("Userbot 已成功啟動，正在監聽群組…")
-            await client.run_until_disconnected()
+            
+            async def keep_alive():
+                """定期發送並刪除訊息至 Saved Messages ('me') 以維持帳號活躍度"""
+                while client.is_connected():
+                    try:
+                        msg = await client.send_message("me", "keep-alive")
+                        if msg:
+                            await msg.delete()
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.debug(f"Userbot 活躍度維持任務發生錯誤: {e}")
+                    await asyncio.sleep(300)  # 每 5 分鐘執行一次
+
+            keep_alive_task = asyncio.create_task(keep_alive())
+            try:
+                await client.run_until_disconnected()
+            finally:
+                keep_alive_task.cancel()
+                
             logger.warning("Userbot 連線已結束，%s 秒後嘗試重連…", USERBOT_RECONNECT_DELAY)
         except asyncio.CancelledError:
             raise
