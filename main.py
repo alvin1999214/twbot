@@ -629,9 +629,13 @@ def main():
 
     bot_app = (
         Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
+        .token(BOT_TOKEN) # Bot 的 Token
+        .post_init(post_init) # 初始化後執行的異步函式
+        .pool_timeout(30) # 連線池請求的逾時時間，預設 20 秒
+        .connection_pool_size(
+            SENDER_POOL_SIZE + 50
+        ) # 連線池大小，根據你的發送器數量動態調整
+        .build() 
     )
     bot_app.add_handler(CommandHandler("start", start_command))
     bot_app.add_handler(CommandHandler("check", check_command))
