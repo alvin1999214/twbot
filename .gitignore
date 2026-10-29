@@ -5,3 +5,4 @@ docker-compose.yml
 # 忽略資料儲存目錄與 Python 快取
 /data/
 __pycache__/
+.venv/

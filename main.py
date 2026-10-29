@@ -3,12 +3,15 @@ import sys
 import json
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone, timedelta
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.error import Forbidden, NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.errors import FloodWaitError, RPCError
+from topic_store import TopicStore
 
 BOT_TOKEN        = os.getenv("BOT_TOKEN")
 BOT_USERNAME     = os.getenv("BOT_USERNAME")
@@ -19,8 +22,14 @@ USERBOT_SESSION  = os.getenv("USERBOT_SESSION", "")
 USERBOT_LIST     = [int(x.strip()) for x in os.getenv("USERBOT_LIST",     "").split(",") if x.strip()]
 LISTENING_GROUPS = [int(x.strip()) for x in os.getenv("LISTENING_GROUPS", "").split(",") if x.strip()]
 
-DATA_DIR          = "/app/data"
+DATA_DIR          = os.path.abspath(os.getenv("DATA_DIR", "/app/data"))
+# Accept the legacy singular filename without silently starting with no users.
 USERS_JSON_PATH   = os.path.join(DATA_DIR, "users.json")
+if not os.path.exists(USERS_JSON_PATH) and os.path.exists(os.path.join(DATA_DIR, "user.json")):
+    USERS_JSON_PATH = os.path.join(DATA_DIR, "user.json")
+THREADED_MODE = os.getenv("THREADED_MODE", "true").lower() in {"true", "1", "yes"}
+topic_store = TopicStore(os.path.join(DATA_DIR, "topics.sqlite3"))
+topic_locks: dict = {}
 MAX_SEND_RETRIES  = int(os.getenv("MAX_SEND_RETRIES",  "3"))
 
 GLOBAL_RATE_LIMIT = int(os.getenv("GLOBAL_RATE_LIMIT", "25"))
@@ -107,37 +116,38 @@ normal_users  = load_normal_users()
 async def get_latest_users_snapshot() -> list:
     global normal_users
     async with users_lock:
-        normal_users = load_normal_users()
+        normal_users = await asyncio.to_thread(load_normal_users)
         return list(normal_users)
 
 async def add_normal_user(uid: int) -> bool:
     global normal_users
     async with users_lock:
-        latest = load_normal_users()
+        latest = await asyncio.to_thread(load_normal_users)
         if uid in latest:
             normal_users = latest
             return False
         latest.add(uid)
-        save_normal_users(latest)
+        await asyncio.to_thread(save_normal_users, latest)
         normal_users = latest
         return True
 
 async def remove_blocked_user(uid: int):
     global normal_users
     async with users_lock:
-        latest = load_normal_users()
+        latest = await asyncio.to_thread(load_normal_users)
         if uid in latest:
             latest.remove(uid)
-            save_normal_users(latest)
+            await asyncio.to_thread(save_normal_users, latest)
             normal_users = latest
             logger.info(f"用戶 {uid} 已封鎖 Bot，已從接收名單移除。")
 
 # ================= Core send helpers =========================================
-async def _safe_send(coro_fn, uid: int):
+async def _safe_send(coro_fn, uid: int, *, rate_limit: bool = True):
     global floodwait_until
     for attempt in range(1, MAX_SEND_RETRIES + 1):
         await wait_if_flooded()
-        await rate_bucket.acquire()
+        if rate_limit:
+            await rate_bucket.acquire()
         try:
             await coro_fn()
             return True
@@ -145,7 +155,8 @@ async def _safe_send(coro_fn, uid: int):
             await remove_blocked_user(uid)
             return False
         except RetryAfter as e:
-            wait_sec = float(getattr(e, "retry_after", 5)) + 1.0
+            delay = e.retry_after
+            wait_sec = (delay.total_seconds() if isinstance(delay, timedelta) else float(delay)) + 1.0
             logger.warning(
                 f"FloodWait {wait_sec:.1f}s triggered while sending to {uid} — pausing ALL sends."
             )
@@ -154,6 +165,9 @@ async def _safe_send(coro_fn, uid: int):
                 asyncio.get_event_loop().time() + wait_sec
             )
             await asyncio.sleep(wait_sec)
+        except BadRequest as e:
+            logger.error("發送給 %s 被 Telegram 拒絕: %s", uid, e)
+            return True  # A failed delivery does not imply the user blocked us.
         except (TimedOut, NetworkError) as e:
             if attempt >= MAX_SEND_RETRIES:
                 logger.error(f"發送給 {uid} 失敗（網路/逾時），已放棄: {e}")
@@ -162,17 +176,65 @@ async def _safe_send(coro_fn, uid: int):
         except Exception as e:
             logger.error(f"發送給 {uid} 未預期錯誤: {e}")
             return True
+    logger.error("發送給 %s 已耗盡限流重試次數。", uid)
+    return True
 
-async def copy_single_with_retry(msg, uid: int) -> bool:
-    return await _safe_send(lambda: msg.copy(chat_id=uid), uid)
+async def get_user_topic(bot, uid: int, group_id: int) -> int | None:
+    if not THREADED_MODE:
+        return None
+    key = (uid, group_id)
+    async with topic_locks.setdefault(key, asyncio.Lock()):
+        row = await topic_store.get(uid, group_id)
+        if row is not None:
+            if row[0] is None:
+                raise RuntimeError(
+                    f"Topic creation outcome unknown for user={uid}, group={group_id}; "
+                    "reconcile topics.sqlite3 before retrying to avoid duplicate topics"
+                )
+            return row[0]
+        await wait_if_flooded()
+        await rate_bucket.acquire()
+        # Persist intent before the API call: a timeout/crash must not create duplicates.
+        await topic_store.set(uid, group_id, None)
+        try:
+            topic = await bot.create_forum_topic(
+                chat_id=uid,
+                name=str(LISTENING_GROUPS_INFO.get(group_id, group_id))[:128],
+            )
+        except (BadRequest, Forbidden, RetryAfter):
+            await topic_store.delete(uid, group_id)
+            raise
+        except NetworkError as exc:
+            raise RuntimeError("建立 topic 的結果不明，已保留待核對記錄，避免重複建立。") from exc
+        await topic_store.set(uid, group_id, topic.message_thread_id)
+        return topic.message_thread_id
 
-async def copy_album_with_retry(bot, from_chat_id: int, msg_ids: list, uid: int) -> bool:
-    return await _safe_send(
-        lambda: bot.copy_messages(
-            chat_id=uid, from_chat_id=from_chat_id, message_ids=msg_ids
-        ),
-        uid,
-    )
+async def copy_media_with_retry(bot, item: dict, uid: int) -> bool:
+    async def send():
+        group_id = item["source_group_id"]
+        for recovery in range(2):
+            thread_id = await get_user_topic(bot, uid, group_id)
+            kwargs = dict(chat_id=uid, from_chat_id=item["from_chat_id"])
+            if thread_id is not None:
+                kwargs["message_thread_id"] = thread_id
+            await wait_if_flooded()
+            await rate_bucket.acquire()
+            try:
+                if item["type"] == "single":
+                    await bot.copy_message(message_id=item["msg_ids"][0], **kwargs)
+                else:
+                    result = await bot.copy_messages(message_ids=item["msg_ids"], **kwargs)
+                    if len(result) != len(item["msg_ids"]):
+                        logger.error("相簿複製不完整 uid=%s group=%s: %s/%s", uid,
+                                     group_id, len(result), len(item["msg_ids"]))
+                return
+            except BadRequest as exc:
+                error = str(exc).lower()
+                missing = "message thread not found" in error or "topic_deleted" in error
+                if not thread_id or recovery or not missing:
+                    raise
+                await topic_store.delete(uid, group_id)
+    return await _safe_send(send, uid, rate_limit=False)
 
 async def send_text_with_retry(bot, text: str, uid: int) -> bool:
     return await _safe_send(lambda: bot.send_message(chat_id=uid, text=text), uid)
@@ -197,12 +259,8 @@ async def _sender_worker(uid: int, bot):
                 continue
 
             try:
-                if item["type"] == "single":
-                    user_alive = await copy_single_with_retry(item["msg"], uid)
-                elif item["type"] == "album":
-                    user_alive = await copy_album_with_retry(
-                        bot, item["from_chat_id"], item["msg_ids"], uid
-                    )
+                if item["type"] in {"single", "album"}:
+                    user_alive = await copy_media_with_retry(bot, item, uid)
                 elif item["type"] == "text":
                     user_alive = await send_text_with_retry(bot, item["text"], uid)
                 else:
@@ -245,13 +303,12 @@ async def broadcast_dispatcher(bot):
                     user_send_queues[uid] = asyncio.Queue()
                     user_sender_tasks[uid] = asyncio.create_task(_sender_worker(uid, bot))
 
-                if job_type == "single":
-                    await user_send_queues[uid].put({"type": "single", "msg": job["msg"]})
-                elif job_type == "album":
+                if job_type in {"single", "album"}:
                     await user_send_queues[uid].put({
-                        "type":         "album",
+                        "type":         job_type,
                         "from_chat_id": job["from_chat_id"],
                         "msg_ids":      job["msg_ids"],
+                        "source_group_id": job["source_group_id"],
                     })
                 elif job_type == "text":
                     await user_send_queues[uid].put({"type": "text", "text": job["text"]})
@@ -370,54 +427,113 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= Bot inbox handler (producer) ==============================
 ptb_media_cache: dict = {}
 ptb_cache_lock: asyncio.Lock | None = None
+completed_relays: dict = {}
+RELAY_PREFIX = "__twbot_source_v1__"
+RELAY_TTL = 600
+
 
 async def bot_inbox_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.effective_attachment:
-        return
+    """Only publish media after an authenticated source marker replies to it.
 
-    global LAST_FORWARD_TIME, FORWARDING_ENABLED
+    Telegram translates the reply target to the bot's message-ID namespace;
+    Telethon's private-chat message IDs must never be used in Bot API copies.
+    """
+    global LAST_FORWARD_TIME
+    msg = update.message
+    if (not msg or msg.chat.type != "private" or not msg.from_user
+            or msg.from_user.id not in USERBOT_LIST):
+        return
     if not FORWARDING_ENABLED:
         return
-        
-    hkt_tz = timezone(timedelta(hours=8))
-    LAST_FORWARD_TIME = datetime.now(hkt_tz).strftime("%Y-%m-%d %H:%M:%S")
 
-    current_users = await get_latest_users_snapshot()
-    if not current_users:
+    marker = re.fullmatch(r"__twbot_source_v1__ (-?\d+) (\d+)", msg.text or "")
+    source_group_id = None
+    expected_count = None
+    media = msg
+    if marker:
+        source_group_id, expected_count = map(int, marker.groups())
+        media = msg.reply_to_message
+        if (source_group_id not in LISTENING_GROUPS or not 1 <= expected_count <= 10
+                or not media or media.chat_id != msg.chat_id
+                or not media.from_user or media.from_user.id != msg.from_user.id):
+            logger.warning("忽略無效中轉來源標記。")
+            return
+    if not media or not media.effective_attachment:
         return
-
-    gid = msg.media_group_id
-    if not gid:
-        await broadcast_queue.put({"type": "single", "msg": msg, "users": current_users})
-    else:
-        async with ptb_cache_lock:
-            if gid not in ptb_media_cache:
-                ptb_media_cache[gid] = []
-                asyncio.create_task(process_ptb_album(msg.chat_id, gid, context.bot))
-            ptb_media_cache[gid].append(msg.message_id)
-
-async def process_ptb_album(from_chat_id: int, gid: str, bot):
-    await asyncio.sleep(0.8)
+    key = (msg.chat_id, "album" if media.media_group_id else "single",
+           media.media_group_id or media.message_id)
+    now = asyncio.get_running_loop().time()
     async with ptb_cache_lock:
-        msg_ids = ptb_media_cache.pop(gid, [])
-    if not msg_ids:
-        return
-    msg_ids.sort()
-    current_users = await get_latest_users_snapshot()
+        for old_key, entry in list(ptb_media_cache.items()):
+            if now - entry["created"] > RELAY_TTL:
+                logger.warning("中轉訊息缺少來源標記或相簿不完整，已丟棄: %s", old_key)
+                del ptb_media_cache[old_key]
+        for old_key, created in list(completed_relays.items()):
+            if now - created > RELAY_TTL:
+                del completed_relays[old_key]
+        if key in completed_relays:
+            return
+        entry = ptb_media_cache.setdefault(key, {
+            "created": now, "ids": set(), "source": None, "count": None,
+        })
+        entry["ids"].add(media.message_id)
+        if marker:
+            if entry["source"] is not None and (entry["source"], entry["count"]) != (
+                    source_group_id, expected_count):
+                logger.error("中轉來源標記衝突，停止處理: %s", key)
+                return
+            entry["source"], entry["count"] = source_group_id, expected_count
+        if entry["source"] is None or len(entry["ids"]) != entry["count"]:
+            return
+        del ptb_media_cache[key]
+        completed_relays[key] = now
+    LAST_FORWARD_TIME = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
     await broadcast_queue.put({
-        "type":         "album",
-        "from_chat_id": from_chat_id,
-        "msg_ids":      msg_ids,
-        "users":        current_users,
+        "type": key[1], "from_chat_id": msg.chat_id,
+        "msg_ids": sorted(entry["ids"]), "source_group_id": entry["source"],
+        "users": await get_latest_users_snapshot(),
     })
+
+
+async def relay_media(client, messages, source_group_id):
+    """Keep forwards/album grouping, then attach source metadata by reply."""
+    forwarded = None
+    for attempt in range(MAX_SEND_RETRIES):
+        try:
+            if forwarded is None:
+                forwarded = await client.forward_messages(BOT_USERNAME, messages)
+                if not isinstance(forwarded, (list, tuple)):
+                    forwarded = [forwarded]
+                if not forwarded or any(message is None for message in forwarded):
+                    logger.error("Userbot 中轉不完整 group=%s", source_group_id)
+                    return
+            await client.send_message(
+                BOT_USERNAME, f"{RELAY_PREFIX} {source_group_id} {len(forwarded)}",
+                reply_to=forwarded[-1].id,
+                parse_mode=None,  # Preserve underscores in the machine-readable marker.
+            )
+            return
+        except FloodWaitError as exc:
+            logger.warning("Userbot 中轉限流，等待 %s 秒。", exc.seconds)
+            await asyncio.sleep(exc.seconds + 1)
+        except RPCError as exc:
+            logger.error("Userbot 中轉 RPC 錯誤 group=%s: %s", source_group_id, exc)
+            return
+        except (OSError, asyncio.TimeoutError) as exc:
+            # Re-forwarding after an ambiguous timeout could duplicate the broadcast.
+            logger.error("Userbot 中轉網路錯誤 group=%s: %s", source_group_id, exc)
+            return
+    logger.error("Userbot 中轉已耗盡限流重試次數 group=%s", source_group_id)
 
 # ================= Userbot listener ==========================================
 media_groups_cache: dict = {}
 cache_lock: asyncio.Lock | None = None
 
+def report_task_failure(task):
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("背景任務失敗", exc_info=task.exception())
+
 async def run_userbot(bot_app: Application):
-    os.chdir(DATA_DIR)
     global LISTENING_GROUPS_INFO
 
     async def process_media_group(client, media_group_id):
@@ -426,12 +542,12 @@ async def run_userbot(bot_app: Application):
             messages = media_groups_cache.pop(media_group_id, [])
         if messages:
             messages.sort(key=lambda x: x.id)
-            try:
-                await client.forward_messages(BOT_USERNAME, messages)
-            except Exception as e:
-                logger.error(f"Userbot 相冊轉發至 Bot 失敗: {e}")
+            await relay_media(client, messages, media_group_id[0])
 
     while True:
+        album_tasks = set()
+        poll_task = None
+        keep_alive_task = None
         client = TelegramClient(
             StringSession(USERBOT_SESSION),
             USERBOT_KEY,
@@ -489,17 +605,17 @@ async def run_userbot(bot_app: Application):
                     if not msg.media or msg.sticker:
                         return
 
-                    media_group_id = msg.grouped_id
-                    if media_group_id is None:
-                        try:
-                            await client.forward_messages(BOT_USERNAME, msg)
-                        except Exception as e:
-                            logger.error(f"Userbot 單圖轉發至 Bot 失敗: {e}")
+                    media_group_id = (msg.chat_id, msg.grouped_id)
+                    if msg.grouped_id is None:
+                        await relay_media(client, msg, msg.chat_id)
                     else:
                         async with cache_lock:
                             if media_group_id not in media_groups_cache:
                                 media_groups_cache[media_group_id] = []
-                                asyncio.create_task(process_media_group(client, media_group_id))
+                                task = asyncio.create_task(process_media_group(client, media_group_id))
+                                album_tasks.add(task)
+                                task.add_done_callback(album_tasks.discard)
+                                task.add_done_callback(report_task_failure)
                             # 避免重複加入
                             if not any(m.id == msg.id for m in media_groups_cache[media_group_id]):
                                 media_groups_cache[media_group_id].append(msg)
@@ -543,7 +659,7 @@ async def run_userbot(bot_app: Application):
                                         except Exception as e:
                                             logger.debug(f"Userbot 輪詢標記已讀失敗: {e}")
                             except asyncio.CancelledError:
-                                break
+                                raise
                             except Exception as e:
                                 logger.debug(f"主動輪詢群組 {group_id} 失敗: {e}")
                         await asyncio.sleep(10)  # 每 10 秒檢查一次
@@ -591,10 +707,16 @@ async def run_userbot(bot_app: Application):
         except Exception as e:
             logger.error("Userbot 發生錯誤，%s 秒後重連: %s", USERBOT_RECONNECT_DELAY, e)
         finally:
+            tasks = list(album_tasks) + [t for t in (poll_task, keep_alive_task) if t]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            media_groups_cache.clear()
             try:
                 await client.disconnect()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Userbot 斷線清理失敗: %s", exc)
 
         await asyncio.sleep(USERBOT_RECONNECT_DELAY)
 
@@ -604,6 +726,14 @@ bg_tasks = set()
 
 async def post_init(application: Application):
     global rate_bucket, broadcast_queue, users_lock, ptb_cache_lock, cache_lock, bg_tasks
+    await asyncio.to_thread(os.makedirs, DATA_DIR, exist_ok=True)
+    await topic_store.initialize()
+    if THREADED_MODE:
+        me = await application.bot.get_me()
+        # PTB 21.1.1 retains newer Bot API fields in api_kwargs.
+        enabled = getattr(me, "has_topics_enabled", me.api_kwargs.get("has_topics_enabled", False))
+        if not enabled:
+            raise RuntimeError("請先在 BotFather 啟用 Threaded Mode，或設定 THREADED_MODE=false。")
     rate_bucket     = TokenBucket(GLOBAL_RATE_LIMIT)
     broadcast_queue = asyncio.Queue()
     
@@ -622,6 +752,19 @@ async def post_init(application: Application):
     # 當任務意外結束時，自動將它從集合中移除
     dispatcher_task.add_done_callback(bg_tasks.discard)
     userbot_task.add_done_callback(bg_tasks.discard)
+    dispatcher_task.add_done_callback(report_task_failure)
+    userbot_task.add_done_callback(report_task_failure)
+
+async def post_stop(application: Application):
+    # Stop producers before the Bot API HTTP client is shut down.
+    tasks = list(bg_tasks) + list(user_sender_tasks.values())
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    bg_tasks.clear()
+    user_sender_tasks.clear()
+    user_send_queues.clear()
 
 def main():
     loop = asyncio.new_event_loop()
@@ -631,6 +774,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN) # Bot 的 Token
         .post_init(post_init) # 初始化後執行的異步函式
+        .post_stop(post_stop)
         .pool_timeout(30) # 連線池請求的逾時時間，預設 20 秒
         .connection_pool_size(
             SENDER_POOL_SIZE + 50

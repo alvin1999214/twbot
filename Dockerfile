@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN mkdir -p /app/data
 
 # 複製程式碼
-COPY main.py .
+COPY main.py topic_store.py .
 
 # 這是解決 Oracle 主機權限的核心：
 # 在容器內創建一個 UID 1000 的 appuser，與主機的 opc/ubuntu 用戶對齊
